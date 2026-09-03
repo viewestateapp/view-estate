@@ -1,0 +1,196 @@
+import Foundation
+
+// MARK: - User-facing preparation status
+
+/// The ONLY statuses a normal user ever sees. The internal pipeline stays invisible.
+enum PreparationStatus: String, Sendable, CaseIterable {
+    case preparing
+    case ready
+    case needsRecapture
+    case error
+    case draft
+
+    var localizationKey: String {
+        switch self {
+        case .preparing: "status.preparing"
+        case .ready: "status.ready"
+        case .needsRecapture: "status.needsRecapture"
+        case .error: "status.error"
+        case .draft: "status.draft"
+        }
+    }
+}
+
+/// Internal processing state model. Never rendered directly — always mapped to `PreparationStatus`.
+enum ProcessingJobState: String, Sendable {
+    case queued
+    case processing
+    case ready
+    case needsReview
+    case failed
+
+    var userFacing: PreparationStatus {
+        switch self {
+        case .queued, .processing: .preparing
+        case .ready: .ready
+        case .needsReview: .needsRecapture
+        case .failed: .error
+        }
+    }
+}
+
+/// Simulated outcome of a preparation job. Development-only switch used to validate
+/// every user-facing state before real processing exists.
+enum CaptureResultMode: String, Sendable, CaseIterable, Identifiable {
+    case success
+    case needsRecapture
+    case error
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .success: "Success"
+        case .needsRecapture: "Needs Recapture"
+        case .error: "Error"
+        }
+    }
+
+    var resolvedJobState: ProcessingJobState {
+        switch self {
+        case .success: .ready
+        case .needsRecapture: .needsReview
+        case .error: .failed
+        }
+    }
+}
+
+/// Live shutter state. While `capturing`, no new sequence may start.
+enum CaptureSessionState: String, Sendable {
+    case idle
+    case capturing
+}
+
+// MARK: - Rooms
+
+enum RoomType: String, Sendable, CaseIterable, Identifiable {
+    case living, kitchen, bedroom, bathroom, dining, office, balcony, exterior, garage, other
+
+    var id: String { rawValue }
+
+    var localizationKey: String { "room.\(rawValue)" }
+
+    var placeholderImage: String {
+        switch self {
+        case .kitchen: "modern_kitchen_interior"
+        case .bedroom: "modern_bedroom_interior"
+        case .exterior, .balcony, .garage: "villa_pool_terrace"
+        default: "modern_living_room"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .living: "sofa"
+        case .kitchen: "cooktop"
+        case .bedroom: "bed.double"
+        case .bathroom: "shower"
+        case .dining: "fork.knife"
+        case .office: "desktopcomputer"
+        case .balcony: "sun.horizon"
+        case .exterior: "tree"
+        case .garage: "car"
+        case .other: "square.dashed"
+        }
+    }
+}
+
+// MARK: - Property
+
+enum PropertyType: String, Sendable, CaseIterable {
+    case apartment, house, land, commercial, development, office, warehouse, other
+}
+
+struct Property: Identifiable, Hashable, Sendable {
+    let id: UUID
+    var reference: String
+    var title: String
+    var type: PropertyType
+    var address: String
+    var city: String
+    var countryCode: String
+    var coverImage: String
+    var rooms: [RoomType]
+    var photoCount: Int
+    var status: PreparationStatus
+    var updatedAt: Date
+    var isFavorite: Bool
+}
+
+// MARK: - Capture
+
+/// One finished bracket sequence belonging to a room of a property.
+struct CaptureItem: Identifiable, Hashable, Sendable {
+    let id: UUID
+    var propertyID: UUID
+    var room: RoomType
+    var image: String
+    var frameCount: Int
+    var jobState: ProcessingJobState
+    var createdAt: Date
+    var isFavorite: Bool
+    /// Immutable original first; every derivative is appended and points back at its parent.
+    var assets: [AssetVersion] = []
+    /// Captured with no connection and not uploaded yet. Never blocks further photography.
+    var isPendingSync: Bool = false
+
+    var status: PreparationStatus { jobState.userFacing }
+
+    var originalAsset: AssetVersion? {
+        assets.first { $0.type == .original }
+    }
+
+    var shortID: String {
+        String(id.uuidString.prefix(8))
+    }
+}
+
+// MARK: - Assets & lineage
+
+enum AssetType: String, Sendable {
+    case original
+    case hdrMaster
+    case aiDerivative
+    case video
+    case preview
+    case thumbnail
+}
+
+/// Originals are immutable: any transformation produces a new asset that points back at its parent.
+struct AssetVersion: Identifiable, Hashable, Sendable {
+    let id: UUID
+    var parentAssetID: UUID?
+    var type: AssetType
+    var label: String
+    var versionNumber: Int
+    var createdAt: Date
+
+    var symbol: String {
+        switch type {
+        case .original: "photo.stack"
+        case .hdrMaster: "square.stack.3d.up"
+        case .aiDerivative: "sparkles"
+        case .video: "play.rectangle"
+        case .preview, .thumbnail: "photo"
+        }
+    }
+}
+
+// MARK: - Sync
+
+enum SyncState: String, Sendable {
+    case synced
+    case pending
+    case uploading
+    case offline
+}

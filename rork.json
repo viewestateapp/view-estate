@@ -1,0 +1,10 @@
+{
+  "apps": [
+    {
+      "name": "View Estate",
+      "path": "ios-view-estate",
+      "framework": "swift"
+    }
+  ],
+  "$schema": "https://rork.com/schema/rork.json"
+}
