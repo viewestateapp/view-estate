@@ -37,7 +37,7 @@ struct HomeView: View {
                     Button {
                         showAccount = true
                     } label: {
-                        Text(initials)
+                        Text(state.userInitials)
                             .font(.system(size: 13, weight: .semibold))
                             .foregroundStyle(VE.textPrimary)
                             .frame(width: 32, height: 32)
@@ -54,10 +54,6 @@ struct HomeView: View {
                 PhotoDetailView(captureID: capture.id, onCapture: onCapture)
             }
         }
-    }
-
-    private var initials: String {
-        String(state.userFirstName.prefix(1)).uppercased() + "R"
     }
 
     // MARK: - Header

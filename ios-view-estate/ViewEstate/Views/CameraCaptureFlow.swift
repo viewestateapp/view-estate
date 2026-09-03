@@ -29,8 +29,13 @@ struct CameraCaptureFlow: View {
                 property: property,
                 room: $room,
                 previewCapturing: previewCapturing,
-                onCaptured: { frameCount in
-                    let capture = state.registerCapture(property: property, room: room, frameCount: frameCount)
+                onCaptured: { attempt, frameCount in
+                    let capture = state.registerCapture(
+                        attempt: attempt,
+                        property: property,
+                        room: attempt.room,
+                        frameCount: frameCount
+                    )
                     withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) {
                         completedCapture = capture
                     }
@@ -85,7 +90,8 @@ struct CameraPrototypeView: View {
     let property: Property
     @Binding var room: RoomType
     var previewCapturing: Bool = false
-    let onCaptured: (Int) -> Void
+    /// Delivers the finished sequence together with the attempt that produced it.
+    let onCaptured: (CaptureAttempt, Int) -> Void
     let onClose: () -> Void
 
     @Environment(AppState.self) private var state
@@ -376,17 +382,18 @@ struct CameraPrototypeView: View {
 
     // MARK: - Simulated bracket
 
-    /// One tap runs the whole nine-exposure sequence. The shutter is locked for its
-    /// duration, so repeated taps can never produce duplicate captures.
+    /// One tap runs the whole nine-exposure sequence under a single capture attempt.
+    /// The shutter stays locked for its duration; the attempt id — not a time window —
+    /// is what makes the resulting registration idempotent.
     private func runSequence() async {
         guard !isCapturing, !previewCapturing else { return }
-        guard state.beginCaptureSequence() else { return }
+        guard let attempt = state.beginCaptureAttempt(property: property, room: room) else { return }
 
         isCapturing = true
         await animateBracket()
         isCapturing = false
         state.endCaptureSequence()
-        onCaptured(exposures.count)
+        onCaptured(attempt, exposures.count)
     }
 
     private func animateBracket() async {

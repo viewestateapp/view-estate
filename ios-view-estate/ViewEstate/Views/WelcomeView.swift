@@ -4,6 +4,9 @@ import SwiftUI
 /// under a readability scrim, the official logo with generous breathing room, a quiet
 /// region selector and the copper primary action.
 struct WelcomeView: View {
+    var onSignIn: () -> Void = {}
+    var onCreateAccount: () -> Void = {}
+
     @Environment(AppState.self) private var state
     @State private var appeared = false
 
@@ -108,16 +111,12 @@ struct WelcomeView: View {
     private var actions: some View {
         VStack(spacing: 12) {
             Button(state.t("welcome.signIn")) {
-                withAnimation(.easeInOut(duration: 0.35)) {
-                    state.isAuthenticated = true
-                }
+                onSignIn()
             }
             .buttonStyle(CopperButtonStyle())
 
             Button(state.t("welcome.createAccount")) {
-                withAnimation(.easeInOut(duration: 0.35)) {
-                    state.isAuthenticated = true
-                }
+                onCreateAccount()
             }
             .buttonStyle(QuietButtonStyle())
 

@@ -71,6 +71,29 @@ enum CaptureSessionState: String, Sendable {
     case capturing
 }
 
+/// One individual shutter action.
+///
+/// Every tap of the shutter mints a brand new `id` (the client capture id). All nine
+/// simulated exposure frames belong to that attempt, and any duplicated completion event
+/// carrying the same id resolves to the same `CaptureItem`. A new shutter action always
+/// mints a new attempt, so two legitimate photographs of the same room in the same second
+/// still produce two distinct captures. Idempotency is never inferred from a time window.
+struct CaptureAttempt: Identifiable, Hashable, Sendable {
+    let id: UUID
+    let propertyID: UUID
+    let room: RoomType
+    let startedAt: Date
+
+    init(propertyID: UUID, room: RoomType, startedAt: Date = .now) {
+        self.id = UUID()
+        self.propertyID = propertyID
+        self.room = room
+        self.startedAt = startedAt
+    }
+
+    var shortID: String { String(id.uuidString.prefix(8)) }
+}
+
 // MARK: - Rooms
 
 enum RoomType: String, Sendable, CaseIterable, Identifiable {
@@ -132,6 +155,8 @@ struct Property: Identifiable, Hashable, Sendable {
 /// One finished bracket sequence belonging to a room of a property.
 struct CaptureItem: Identifiable, Hashable, Sendable {
     let id: UUID
+    /// Idempotency key of the shutter action that produced this capture.
+    var clientCaptureID: UUID = UUID()
     var propertyID: UUID
     var room: RoomType
     var image: String

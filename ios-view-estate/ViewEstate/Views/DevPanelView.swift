@@ -92,6 +92,7 @@ struct DevPanelView: View {
                         debugRow("Property", property.title)
                         debugRow("Room", state.roomName(capture.room))
                         debugRow("Capture ID", capture.shortID)
+                        debugRow("Client Capture ID", String(capture.clientCaptureID.uuidString.prefix(8)))
                         debugRow("Capture State", state.captureSessionState.rawValue)
                         debugRow("Processing State", capture.jobState.rawValue)
                         debugRow("User Status", state.t(capture.status.localizationKey))

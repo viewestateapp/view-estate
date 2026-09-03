@@ -9,8 +9,22 @@ final class AppState {
     // MARK: - Session
 
     var isAuthenticated: Bool = false
-    var userFirstName: String = "Ana"
+    var userFullName: String = "Ana Ribeiro"
+    var userEmail: String = "ana@viewestate.pt"
     var organizationName: String = "Ana Ribeiro Workspace"
+    /// Answers captured during sign-up. They personalise defaults, never gate features.
+    private(set) var userProfile: ProfileType?
+    private(set) var userVolume: MonthlyVolume?
+    private(set) var userGoals: Set<WorkGoal> = []
+
+    var userFirstName: String {
+        userFullName.split(separator: " ").first.map(String.init) ?? userFullName
+    }
+
+    var userInitials: String {
+        let letters = userFullName.split(separator: " ").prefix(2).compactMap { $0.first.map(String.init) }
+        return letters.isEmpty ? "VE" : letters.joined().uppercased()
+    }
 
     // MARK: - Region & locale
 
@@ -78,6 +92,8 @@ final class AppState {
     /// While `capturing`, the shutter is locked so a single tap can never create two captures.
     private(set) var captureSessionState: CaptureSessionState = .idle
     private(set) var lastCaptureID: UUID?
+    /// Client capture id of the most recent shutter action, shown in the developer panel.
+    private(set) var lastAttemptID: UUID?
 
     /// Development-only outcome of the simulated preparation.
     var captureResultMode: CaptureResultMode = .success
@@ -151,32 +167,35 @@ final class AppState {
 
     // MARK: - Capture flow (prototype)
 
-    /// Locks the shutter for the duration of one simulated bracket sequence.
-    /// Returns `false` when a sequence is already running, so repeated taps are ignored.
-    func beginCaptureSequence() -> Bool {
-        guard captureSessionState == .idle else { return false }
+    /// Opens one individual shutter action and locks the shutter for its duration.
+    /// Returns `nil` when a sequence is already running, so repeated taps are ignored by the UI.
+    func beginCaptureAttempt(property: Property, room: RoomType) -> CaptureAttempt? {
+        guard captureSessionState == .idle else { return nil }
         captureSessionState = .capturing
-        return true
+        let attempt = CaptureAttempt(propertyID: property.id, room: room)
+        lastAttemptID = attempt.id
+        return attempt
     }
 
     func endCaptureSequence() {
         captureSessionState = .idle
     }
 
-    /// Registers a finished capture sequence and starts its background preparation.
+    /// Registers the finished sequence of one shutter action and starts its background
+    /// preparation. Idempotency is keyed on the attempt: duplicated completion events from
+    /// the SAME attempt resolve to the same capture, while a new shutter action — even in the
+    /// same property, same room, same second — always produces a new capture.
     /// The pipeline is never surfaced: the user only ever sees "A preparar" → "Pronta".
-    func registerCapture(property: Property, room: RoomType, frameCount: Int) -> CaptureItem {
-        // Duplicate guard: an accidental double trigger cannot create two captures.
-        if let recent = captures.first,
-           recent.propertyID == property.id,
-           recent.room == room,
-           Date().timeIntervalSince(recent.createdAt) < 1.2 {
-            return recent
+    @discardableResult
+    func registerCapture(attempt: CaptureAttempt, property: Property, room: RoomType, frameCount: Int) -> CaptureItem {
+        if let existing = captures.first(where: { $0.clientCaptureID == attempt.id }) {
+            return existing
         }
 
         let createdAt = Date()
         let item = CaptureItem(
             id: UUID(),
+            clientCaptureID: attempt.id,
             propertyID: property.id,
             room: room,
             image: room.placeholderImage,
@@ -299,6 +318,60 @@ final class AppState {
         }
     }
 
+    // MARK: - Session lifecycle
+
+    /// Mock sign-in for an existing account. No provider is contacted in this phase.
+    func signIn(email: String) {
+        let trimmed = email.trimmingCharacters(in: .whitespaces)
+        if !trimmed.isEmpty { userEmail = trimmed }
+        isAuthenticated = true
+    }
+
+    /// Completes account creation. The plan is a recommendation from the answers;
+    /// the included allocation is granted through `CreditService`, never written directly.
+    func completeOnboarding(
+        draft: AccountDraft,
+        profile: ProfileType?,
+        volume: MonthlyVolume?,
+        goals: Set<WorkGoal>,
+        plan planID: PlanID
+    ) {
+        userFullName = draft.fullName.trimmingCharacters(in: .whitespaces)
+        userEmail = draft.email.trimmingCharacters(in: .whitespaces)
+        organizationName = draft.workspaceName
+        userProfile = profile
+        userVolume = volume
+        userGoals = goals
+
+        subscription.planID = planID
+        subscription.status = .trial
+        subscription.region = regionCode
+        subscription.currentPeriodStart = .now
+        subscription.currentPeriodEnd = Calendar.current.date(byAdding: .day, value: 14, to: .now) ?? .now
+
+        grantPlanAllocation(planID: planID, reference: "signup_\(subscription.id.uuidString)")
+        isAuthenticated = true
+    }
+
+    /// Grants the plan's included credits exactly once per reference.
+    private func grantPlanAllocation(planID: PlanID, reference: String) {
+        wallet = CreditWallet(includedCredits: 0, purchasedCredits: wallet.purchasedCredits)
+        let result = CreditService.allocatePlanCredits(
+            wallet: wallet,
+            amount: PlanCatalog.plan(planID).includedAICredits,
+            label: "credits.tx.allocation",
+            existing: transactions,
+            idempotencyKey: reference
+        )
+        guard !result.duplicateIgnored, let transaction = result.transaction else { return }
+        wallet = result.wallet
+        transactions.insert(transaction, at: 0)
+    }
+
+    func signOut() {
+        isAuthenticated = false
+    }
+
     // MARK: - Developer overrides
 
     func devSetCredits(included: Int, purchased: Int) {
@@ -325,6 +398,7 @@ final class AppState {
         captureSessionState = .idle
         captureResultMode = .success
         lastCaptureID = nil
+        lastAttemptID = nil
         isOnline = true
         syncState = .synced
     }

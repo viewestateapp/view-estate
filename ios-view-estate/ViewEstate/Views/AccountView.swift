@@ -62,7 +62,7 @@ struct AccountView: View {
                 Section {
                     Button(role: .destructive) {
                         withAnimation(.easeInOut(duration: 0.3)) {
-                            state.isAuthenticated = false
+                            state.signOut()
                         }
                         dismiss()
                     } label: {
@@ -92,19 +92,22 @@ struct AccountView: View {
 
     private var profileRow: some View {
         HStack(spacing: 14) {
-            Text(String(state.userFirstName.prefix(1)).uppercased() + "R")
+            Text(state.userInitials)
                 .font(.system(size: 18, weight: .semibold))
                 .foregroundStyle(VE.textPrimary)
                 .frame(width: 52, height: 52)
                 .background(VE.elevated, in: .circle)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("\(state.userFirstName) Ribeiro")
+                Text(state.userFullName)
                     .font(VE.Font.cardTitle)
                     .foregroundStyle(VE.textPrimary)
                 Text(state.organizationName)
                     .font(VE.Font.caption)
                     .foregroundStyle(VE.textSecondary)
+                Text(state.userEmail)
+                    .font(VE.Font.caption)
+                    .foregroundStyle(VE.textTertiary)
             }
             Spacer()
         }
