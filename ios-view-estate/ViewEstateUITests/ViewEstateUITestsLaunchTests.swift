@@ -20,10 +20,10 @@ final class ViewEstateUITestsLaunchTests: XCTestCase {
     @MainActor
     func testLaunch() throws {
         let app = XCUIApplication()
+        app.launchEnvironment["VE_REGION_OVERRIDE"] = "PT"
         app.launch()
 
-        // Insert steps here to perform after app launch but before taking a screenshot,
-        // such as logging into a test account or navigating somewhere in the app
+        _ = app.buttons["welcome.signIn"].waitForExistence(timeout: 20)
 
         let attachment = XCTAttachment(screenshot: app.screenshot())
         attachment.name = "Launch Screen"

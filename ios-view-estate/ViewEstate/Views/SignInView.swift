@@ -54,13 +54,15 @@ struct SignInView: View {
                             text: $email,
                             errorText: state.t("error.email"),
                             keyboard: .emailAddress,
-                            contentType: .emailAddress
+                            contentType: .emailAddress,
+                            identifier: "signin.email"
                         )
                         OnboardingField(
                             label: state.t("field.password"),
                             text: $password,
                             contentType: .password,
-                            isSecure: true
+                            isSecure: true,
+                            identifier: "signin.password"
                         )
 
                         Button(state.t("signin.forgot")) {}
@@ -86,6 +88,7 @@ struct SignInView: View {
                         submit()
                     }
                     .buttonStyle(CopperButtonStyle())
+                    .accessibilityIdentifier("signin.cta")
                     .disabled(!canSubmit)
                     .opacity(canSubmit ? 1 : 0.45)
                     .animation(.easeOut(duration: 0.2), value: canSubmit)

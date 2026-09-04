@@ -114,11 +114,13 @@ struct WelcomeView: View {
                 onSignIn()
             }
             .buttonStyle(CopperButtonStyle())
+            .accessibilityIdentifier("welcome.signIn")
 
             Button(state.t("welcome.createAccount")) {
                 onCreateAccount()
             }
             .buttonStyle(QuietButtonStyle())
+            .accessibilityIdentifier("welcome.createAccount")
 
             Button(state.t("welcome.chooseCountry")) {
                 let next: RegionCode = state.regionCode == .pt ? .br : .pt

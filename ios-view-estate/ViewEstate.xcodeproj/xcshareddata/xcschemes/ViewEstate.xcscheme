@@ -38,6 +38,16 @@
                ReferencedContainer = "container:ViewEstate.xcodeproj">
             </BuildableReference>
          </TestableReference>
+         <TestableReference
+            skipped = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "105FC5922E9EAD3200EA8BCF"
+               BuildableName = "ViewEstateUITests.xctest"
+               BlueprintName = "ViewEstateUITests"
+               ReferencedContainer = "container:ViewEstate.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
       </Testables>
    </TestAction>
    <LaunchAction

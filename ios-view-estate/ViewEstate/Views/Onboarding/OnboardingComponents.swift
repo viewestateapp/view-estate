@@ -59,6 +59,7 @@ struct ChoiceRow: View {
     let title: String
     var detail: String?
     var symbol: String?
+    var identifier: String?
     let isSelected: Bool
     let action: () -> Void
 
@@ -107,6 +108,7 @@ struct ChoiceRow: View {
             }
         }
         .buttonStyle(PressableStyle())
+        .accessibilityIdentifier(identifier ?? title)
         .accessibilityAddTraits(isSelected ? [.isSelected] : [])
     }
 }
@@ -130,6 +132,7 @@ struct OnboardingField: View {
     var contentType: UITextContentType?
     var isSecure: Bool = false
     var autocapitalization: TextInputAutocapitalization = .never
+    var identifier: String?
 
     @FocusState private var isFocused: Bool
     @State private var wasEdited = false
@@ -159,6 +162,7 @@ struct OnboardingField: View {
             .textInputAutocapitalization(autocapitalization)
             .autocorrectionDisabled()
             .focused($isFocused)
+            .accessibilityIdentifier(identifier ?? label)
             .padding(.horizontal, VE.Space.m)
             .frame(height: 52)
             .background {
@@ -197,9 +201,13 @@ struct VerificationCodeField: View {
                 .textContentType(.oneTimeCode)
                 .focused($isFocused)
                 .opacity(0.001)
+                .accessibilityIdentifier("onboarding.code")
                 .onChange(of: code) { _, newValue in
                     let digits = newValue.filter(\.isNumber)
                     code = String(digits.prefix(length))
+                    // The keypad has no return key — step aside once the code is complete
+                    // so the confirmation action is never left under the keyboard.
+                    if code.count == length { isFocused = false }
                 }
 
             HStack(spacing: 10) {

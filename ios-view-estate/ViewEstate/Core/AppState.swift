@@ -112,7 +112,9 @@ final class AppState {
     private static let regionKey = "ve.region"
 
     init() {
-        let stored = UserDefaults.standard.string(forKey: Self.regionKey)
+        // A launch environment override keeps automated runs deterministic in either market.
+        let override = ProcessInfo.processInfo.environment["VE_REGION_OVERRIDE"]
+        let stored = override ?? UserDefaults.standard.string(forKey: Self.regionKey)
         let resolved = RegionResolver.resolve(storedPreference: stored)
         regionCode = resolved
         properties = MockData.properties()

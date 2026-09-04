@@ -101,6 +101,7 @@ struct HomeView: View {
                 statistic(value: "\(state.wallet.total)", label: state.t("home.stat.credits"), tint: VE.ai)
             }
             .buttonStyle(.plain)
+            .accessibilityIdentifier("home.credits")
         }
         .padding(.vertical, VE.Space.m)
         .veCard()

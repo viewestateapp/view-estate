@@ -37,7 +37,7 @@ struct OnboardingFlow: View {
                     .padding(.bottom, VE.Space.xl)
                 }
                 .scrollIndicators(.hidden)
-                .scrollDismissesKeyboard(.interactively)
+                .scrollDismissesKeyboard(.immediately)
 
                 footer
             }
@@ -101,6 +101,7 @@ struct OnboardingFlow: View {
                 }
                 .font(.system(size: 14, weight: .medium))
                 .foregroundStyle(VE.textSecondary)
+                .accessibilityIdentifier("onboarding.resend")
             case .done:
                 primaryButton(title: state.t("onboarding.done.cta"), enabled: true) { finish() }
             }
@@ -115,6 +116,7 @@ struct OnboardingFlow: View {
             Text(title)
         }
         .buttonStyle(CopperButtonStyle())
+        .accessibilityIdentifier("onboarding.cta")
         .disabled(!enabled)
         .opacity(enabled ? 1 : 0.45)
         .animation(.easeOut(duration: 0.2), value: enabled)
@@ -146,6 +148,7 @@ struct OnboardingFlow: View {
                         title: state.t(item.localizationKey),
                         detail: state.t(item.descriptionKey),
                         symbol: item.symbol,
+                        identifier: item.localizationKey,
                         isSelected: profile == item
                     ) {
                         profile = item
@@ -166,6 +169,7 @@ struct OnboardingFlow: View {
                 ForEach(MonthlyVolume.allCases) { item in
                     ChoiceRow(
                         title: state.t(item.localizationKey),
+                        identifier: item.localizationKey,
                         isSelected: volume == item
                     ) {
                         volume = item
@@ -187,6 +191,7 @@ struct OnboardingFlow: View {
                     ChoiceRow(
                         title: state.t(item.localizationKey),
                         symbol: item.symbol,
+                        identifier: item.localizationKey,
                         isSelected: goals.contains(item)
                     ) {
                         if goals.contains(item) {
@@ -212,34 +217,39 @@ struct OnboardingFlow: View {
                 text: $draft.fullName,
                 errorText: errorText(AccountValidation.nameError(draft.fullName)),
                 contentType: .name,
-                autocapitalization: .words
+                autocapitalization: .words,
+                identifier: "field.name"
             )
             OnboardingField(
                 label: state.t("field.email"),
                 text: $draft.email,
                 errorText: errorText(AccountValidation.emailError(draft.email)),
                 keyboard: .emailAddress,
-                contentType: .emailAddress
+                contentType: .emailAddress,
+                identifier: "field.email"
             )
             OnboardingField(
                 label: state.t("field.phone"),
                 text: $draft.phone,
                 errorText: errorText(AccountValidation.phoneError(draft.phone)),
                 keyboard: .phonePad,
-                contentType: .telephoneNumber
+                contentType: .telephoneNumber,
+                identifier: "field.phone"
             )
             OnboardingField(
                 label: state.t("field.company"),
                 text: $draft.company,
                 contentType: .organizationName,
-                autocapitalization: .words
+                autocapitalization: .words,
+                identifier: "field.company"
             )
             OnboardingField(
                 label: state.t("field.password"),
                 text: $draft.password,
                 errorText: errorText(AccountValidation.passwordError(draft.password)),
                 contentType: .newPassword,
-                isSecure: true
+                isSecure: true,
+                identifier: "field.password"
             )
 
             regionRow
@@ -382,6 +392,7 @@ struct OnboardingFlow: View {
             }
             .font(.system(size: 14, weight: .medium))
             .foregroundStyle(VE.copper)
+            .accessibilityIdentifier("onboarding.region.change")
         }
         .padding(VE.Space.m)
         .veCard(radius: VE.Radius.tile)
@@ -406,6 +417,7 @@ struct OnboardingFlow: View {
             }
         }
         .buttonStyle(PressableStyle())
+        .accessibilityIdentifier("onboarding.consent")
         .accessibilityAddTraits(draft.acceptedTerms ? [.isSelected] : [])
     }
 

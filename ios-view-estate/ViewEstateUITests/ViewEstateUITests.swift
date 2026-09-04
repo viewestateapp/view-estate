@@ -2,40 +2,24 @@
 //  ViewEstateUITests.swift
 //  ViewEstateUITests
 //
-//  Created by Rork on September 3, 2026.
-//
 
 import XCTest
 
+/// Launch smoke test: the brand welcome owns the first screen and offers both entry points.
 final class ViewEstateUITests: XCTestCase {
 
     override func setUpWithError() throws {
-        // Put setup code here. This method is called before the invocation of each test method in the class.
-
-        // In UI tests it is usually best to stop immediately when a failure occurs.
         continueAfterFailure = false
-
-        // In UI tests it's important to set the initial state - such as interface orientation - required for your tests before they run. The setUp method is a good place to do this.
-    }
-
-    override func tearDownWithError() throws {
-        // Put teardown code here. This method is called after the invocation of each test method in the class.
     }
 
     @MainActor
-    func testExample() throws {
-        // UI tests must launch the application that they test.
+    func testWelcomeIsTheFirstScreen() throws {
         let app = XCUIApplication()
+        app.launchEnvironment["VE_REGION_OVERRIDE"] = "PT"
         app.launch()
 
-        // Use XCTAssert and related functions to verify your tests produce the correct results.
-    }
-
-    @MainActor
-    func testLaunchPerformance() throws {
-        // This measures how long it takes to launch your application.
-        measure(metrics: [XCTApplicationLaunchMetric()]) {
-            XCUIApplication().launch()
-        }
+        XCTAssertTrue(app.buttons["welcome.signIn"].waitForExistence(timeout: 20))
+        XCTAssertTrue(app.buttons["welcome.createAccount"].exists)
+        XCTAssertTrue(app.staticTexts["Capture. Valorize. Publique."].exists)
     }
 }
