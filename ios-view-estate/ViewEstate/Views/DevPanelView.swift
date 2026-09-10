@@ -96,9 +96,13 @@ struct DevPanelView: View {
                     .pickerStyle(.segmented)
 
                     flag("camera_native_enabled", state.cameraMode.isNative)
+                    debugRow("Native Camera", state.cameraMode.isNative ? "ON" : "OFF")
                     debugRow("Permission", diagnostics.access.devLabel)
+                    debugRow("captureSource", diagnostics.captureSource.devLabel)
+                    debugRow("hdrSource", diagnostics.hdrSource.devLabel)
                     if let setup = diagnostics.setup {
                         debugRow("Device", setup.deviceName)
+                        debugRow("iOS", setup.systemVersion)
                         debugRow("Camera ID", setup.deviceID)
                         debugRow("Lens", setup.lens)
                         debugRow("Capture resolution", setup.captureResolution)
@@ -107,19 +111,80 @@ struct DevPanelView: View {
                             .font(.system(size: 13))
                             .foregroundStyle(VE.textTertiary)
                     }
+                    if let code = diagnostics.lastErrorCode {
+                        debugRow("Last error", code)
+                    }
+                }
+                .listRowBackground(VE.surface)
+
+                Section("Exposure capability") {
+                    if let capabilities = diagnostics.capabilities {
+                        debugRow("min EV", capabilities.minExposureBiasDescription)
+                        debugRow("max EV", capabilities.maxExposureBiasDescription)
+                        debugRow("max bracket count", "\(capabilities.maxBracketCount)")
+                        debugRow("Bracket capture", capabilities.supportsBracketCapture ? "YES" : "NO")
+                        debugRow("Exposure lock", capabilities.supportsExposureLock ? "YES" : "NO")
+                        debugRow("Custom exposure", capabilities.supportsCustomExposure ? "YES" : "NO")
+                        debugRow("Focus lock", capabilities.supportsFocusLock ? "YES" : "NO")
+                        debugRow("White balance lock", capabilities.supportsWhiteBalanceLock ? "YES" : "NO")
+                        debugRow("Lens stabilization", capabilities.supportsLensStabilization ? "YES" : "NO")
+                        debugRow("Active format", capabilities.activeFormat)
+                    } else {
+                        Text("Capabilities are read when the native camera starts.")
+                            .font(.system(size: 13))
+                            .foregroundStyle(VE.textTertiary)
+                    }
+                    if let plan = diagnostics.plan {
+                        debugRow("Selected Capture Profile", plan.profile.devLabel)
+                        debugRow("Ladder", plan.exposureValues.map(String.init).joined(separator: " "))
+                        debugRow("Bracket requests", plan.segmentDescription)
+                        Text(plan.reason)
+                            .font(.system(size: 12))
+                            .foregroundStyle(VE.textTertiary)
+                    }
+                }
+                .listRowBackground(VE.surface)
+
+                Section("Last bracket") {
+                    if let manifest = diagnostics.lastManifest {
+                        debugRow("Client Capture ID", String(manifest.clientCaptureID.uuidString.prefix(8)))
+                        debugRow("Capture Profile", manifest.captureProfile.devLabel)
+                        debugRow("Expected Frames", "\(manifest.expectedFrameCount)")
+                        debugRow("Captured Frames", "\(manifest.actualFrameCount)")
+                        debugRow("Bundle state", manifest.state.devLabel)
+                        debugRow("Orientation", manifest.orientation.devLabel)
+                        debugRow("Focus lock", manifest.focusLockSucceeded.devLabel)
+                        debugRow("White balance lock", manifest.whiteBalanceLockSucceeded.devLabel)
+                        debugRow("Bracket duration", manifest.bracketDurationDescription)
+                        debugRow("First frame", seconds(manifest.firstFrameSeconds))
+                        debugRow("Local persistence", seconds(manifest.persistSeconds))
+                        debugRow("Manifest", seconds(manifest.manifestSeconds))
+                        debugRow("Total local size", manifest.totalSizeDescription)
+                        if let failureCode = manifest.failureCode {
+                            debugRow("Failure", failureCode)
+                        }
+                        NavigationLink {
+                            DevFrameInspectorView(manifest: manifest)
+                        } label: {
+                            Text("Frame inspector · \(manifest.frames.count) exposures")
+                                .font(.system(size: 14, weight: .medium))
+                                .foregroundStyle(VE.copper)
+                        }
+                    } else {
+                        Text("No native bracket captured in this run.")
+                            .font(.system(size: 13))
+                            .foregroundStyle(VE.textTertiary)
+                    }
                     if let file = diagnostics.lastFile {
+                        debugRow("Reference frame", file.fileName)
                         debugRow("Image dimensions", file.pixelDescription)
                         debugRow("Displayed as", file.displayDescription)
-                        debugRow("Orientation", file.orientation.devLabel)
                         debugRow("EXIF orientation", "\(file.exifOrientation)")
                         debugRow("File size", file.sizeDescription)
                         debugRow("Local file path", CaptureFileStore.path(for: file))
                     }
                     if let duration = diagnostics.captureDurationDescription {
                         debugRow("Capture duration", duration)
-                    }
-                    if let code = diagnostics.lastErrorCode {
-                        debugRow("Last error", code)
                     }
                 }
                 .listRowBackground(VE.surface)
@@ -132,6 +197,9 @@ struct DevPanelView: View {
                         debugRow("Client Capture ID", String(capture.clientCaptureID.uuidString.prefix(8)))
                         debugRow("Camera Mode", diagnostics.mode.devLabel)
                         debugRow("Capture State", state.captureStageLabel)
+                        debugRow("Capture Source", capture.captureSource.devLabel)
+                        debugRow("HDR Source", capture.hdrSource.devLabel)
+                        debugRow("Frames", "\(capture.frameCount)")
                         debugRow("Processing State", capture.jobState.rawValue)
                         debugRow("User Status", state.t(capture.status.localizationKey))
                         debugRow("Asset State", capture.assets.map(\.type.rawValue).joined(separator: " → "))
@@ -253,6 +321,19 @@ struct DevPanelView: View {
                 .listRowBackground(VE.surface)
                 .foregroundStyle(VE.textPrimary)
 
+                Section("Local capture storage") {
+                    debugRow("Capture bundles", "\(bundles.count)")
+                    debugRow("Valid bundles", "\(bundles.filter { $0.state.isValid }.count)")
+                    debugRow("Incomplete bundles", "\(bundles.filter { !$0.state.isValid }.count)")
+                    debugRow("Total on disk", totalStorageDescription)
+                    Button("Restore pending captures") { state.restorePendingCaptures() }
+                    Button("Clean up incomplete (7+ days)") {
+                        CaptureBundleStore.cleanupIncomplete()
+                    }
+                }
+                .listRowBackground(VE.surface)
+                .foregroundStyle(VE.textPrimary)
+
                 Section("Portfolio") {
                     Button("Empty portfolio") { state.properties = [] }
                     Button("Reset mock data") { state.devReset() }
@@ -299,6 +380,18 @@ struct DevPanelView: View {
 
     private var developmentProperties: [Property] {
         state.properties.filter(\.isDevelopmentProperty)
+    }
+
+    private var bundles: [CaptureManifest] { CaptureBundleStore.allManifests() }
+
+    private var totalStorageDescription: String {
+        let bytes = bundles.reduce(0) { $0 + $1.totalByteCount }
+        return String(format: "%.1f MB", Double(bytes) / 1_048_576)
+    }
+
+    private func seconds(_ value: Double?) -> String {
+        guard let value else { return "—" }
+        return String(format: "%.2f s", value)
     }
 
     // MARK: - Bindings

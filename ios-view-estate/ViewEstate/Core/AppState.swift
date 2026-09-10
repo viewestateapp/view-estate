@@ -110,10 +110,24 @@ final class AppState {
         mode: FeatureFlags.cameraNativeEnabled ? .native : .simulated
     )
 
-    /// READY → CAPTURING → LOCAL_READY, as reported in the developer panel.
+    /// True while a finished bracket is being checked against its manifest.
+    private(set) var isValidatingCapture: Bool = false
+
+    /// READY → CAPTURING → LOCAL_VALIDATING → LOCAL_READY, as reported in the developer panel.
     var captureStageLabel: String {
-        if captureSessionState == .capturing { return "CAPTURING" }
+        if captureSessionState == .capturing {
+            return isValidatingCapture ? "LOCAL_VALIDATING" : "CAPTURING"
+        }
         return lastCapture?.hasLocalOriginal == true ? "LOCAL_READY" : "READY"
+    }
+
+    /// The frames of a finished bracket are on the device; the bundle is now being verified.
+    func beginLocalValidation() {
+        isValidatingCapture = true
+    }
+
+    func endLocalValidation() {
+        isValidatingCapture = false
     }
 
     var lastCapture: CaptureItem? {
@@ -147,6 +161,9 @@ final class AppState {
             currentPeriodEnd: Date().addingTimeInterval(86400 * 18),
             cancelAtPeriodEnd: false
         )
+
+        // A capture whose frames and manifest were safely persisted survives a relaunch.
+        restorePendingCaptures()
     }
 
     // MARK: - Localisation
@@ -197,6 +214,49 @@ final class AppState {
 
     func endCaptureSequence() {
         captureSessionState = .idle
+        isValidatingCapture = false
+    }
+
+    /// Rebuilds captures whose bracket and manifest were fully persisted before the app closed,
+    /// and puts them back in the sync queue. Incomplete or interrupted bundles are never restored.
+    @discardableResult
+    func restorePendingCaptures() -> Int {
+        let known = Set(captures.map(\.clientCaptureID))
+        var restored = 0
+
+        for manifest in CaptureBundleStore.allManifests()
+        where manifest.state.isValid && !known.contains(manifest.clientCaptureID) {
+            guard let property = properties.first(where: { $0.id == manifest.propertyID }),
+                  let room = RoomType(rawValue: manifest.roomID),
+                  let reference = manifest.referenceFrame,
+                  CaptureBundleValidator.validate(manifest) == nil
+            else { continue }
+
+            let createdAt = manifest.completedAt ?? manifest.startedAt
+            let item = CaptureItem(
+                id: manifest.captureID ?? UUID(),
+                clientCaptureID: manifest.clientCaptureID,
+                propertyID: property.id,
+                room: room,
+                image: room.placeholderImage,
+                frameCount: manifest.actualFrameCount,
+                jobState: .queued,
+                createdAt: createdAt,
+                isFavorite: false,
+                assets: [MockData.originalFrames(frameCount: manifest.actualFrameCount, createdAt: createdAt)],
+                isPendingSync: true,
+                localFile: reference.localPhotoFile,
+                manifest: manifest
+            )
+            captures.insert(item, at: 0)
+            restored += 1
+        }
+
+        if restored > 0 {
+            syncState = isOnline ? .uploading : .pending
+            VELog.camera("restored \(restored) pending capture(s) from local storage")
+        }
+        return restored
     }
 
     /// Registers the finished sequence of one shutter action and starts its background
@@ -210,7 +270,8 @@ final class AppState {
         property: Property,
         room: RoomType,
         frameCount: Int,
-        localFile: LocalPhotoFile? = nil
+        localFile: LocalPhotoFile? = nil,
+        manifest: CaptureManifest? = nil
     ) -> CaptureItem {
         if let existing = captures.first(where: { $0.clientCaptureID == attempt.id }) {
             return existing
@@ -229,10 +290,19 @@ final class AppState {
             isFavorite: false,
             assets: [MockData.originalFrames(frameCount: frameCount, createdAt: createdAt)],
             isPendingSync: !isOnline,
-            localFile: localFile
+            localFile: localFile,
+            manifest: manifest
         )
         captures.insert(item, at: 0)
         lastCaptureID = item.id
+
+        // The bundle learns the capture it became, so a restart can reconnect the two.
+        if var manifest {
+            manifest.captureID = item.id
+            try? CaptureBundleStore.writeManifest(manifest)
+            captures[0].manifest = manifest
+            cameraDiagnostics.lastManifest = manifest
+        }
 
         // A real photograph gets a local record so its property and room association survives
         // on the device, with no connectivity involved.
@@ -445,6 +515,7 @@ final class AppState {
         captureResultMode = .success
         lastCaptureID = nil
         lastAttemptID = nil
+        isValidatingCapture = false
         cameraDiagnostics = CameraDiagnostics(mode: cameraMode)
         isOnline = true
         syncState = .synced

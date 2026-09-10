@@ -30,9 +30,16 @@ enum CaptureFileStore {
         return directory.appendingPathComponent(fileName, isDirectory: false)
     }
 
+    /// Resolves a stored original, whether it is a flat single photograph or one frame inside a
+    /// capture bundle.
+    nonisolated static func url(for file: LocalPhotoFile) -> URL? {
+        guard let bundleID = file.bundleID else { return url(for: file.fileName) }
+        return CaptureBundleStore.url(clientCaptureID: bundleID, fileName: file.fileName)
+    }
+
     /// Absolute path shown in the developer panel.
     nonisolated static func path(for file: LocalPhotoFile) -> String {
-        url(for: file.fileName)?.path ?? file.fileName
+        url(for: file)?.path ?? file.fileName
     }
 
     /// Writes one original photograph. Named after the shutter action that produced it, so a
@@ -96,7 +103,7 @@ enum CaptureFileStore {
     }
 
     nonisolated static func loadData(_ file: LocalPhotoFile) -> Data? {
-        guard let url = url(for: file.fileName) else { return nil }
+        guard let url = url(for: file) else { return nil }
         return try? Data(contentsOf: url)
     }
 

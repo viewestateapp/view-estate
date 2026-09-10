@@ -175,13 +175,25 @@ struct CaptureItem: Identifiable, Hashable, Sendable {
     var assets: [AssetVersion] = []
     /// Captured with no connection and not uploaded yet. Never blocks further photography.
     var isPendingSync: Bool = false
-    /// The real photograph stored in the app container. Present for native camera captures.
+    /// The reference exposure (EV 0) stored in the app container. Present for native captures.
     var localFile: LocalPhotoFile?
+    /// Complete local record of the real bracket behind this capture: every exposure, its
+    /// metadata and its checksum. Absent for simulated captures.
+    var manifest: CaptureManifest?
 
     var status: PreparationStatus { jobState.userFacing }
 
     /// A capture whose original bytes already live on this device.
     var hasLocalOriginal: Bool { localFile != nil }
+
+    /// Real photographs from the native camera, as opposed to the simulated prototype.
+    var captureSource: CaptureSource { manifest?.captureSource ?? .simulated }
+
+    /// The HDR master is still simulated in this phase, whatever the pixels came from.
+    var hdrSource: HDRSource { manifest?.hdrSource ?? .mock }
+
+    /// Every real exposure of this capture, in ladder order.
+    var frames: [CaptureFrame] { manifest?.orderedFrames ?? [] }
 
     var originalAsset: AssetVersion? {
         assets.first { $0.type == .original }

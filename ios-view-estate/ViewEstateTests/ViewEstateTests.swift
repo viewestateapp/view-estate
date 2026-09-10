@@ -429,4 +429,491 @@ struct LocalizationTests {
         #expect(missingInBR.isEmpty)
         #expect(missingInPT.isEmpty)
     }
+
+    // The bracket failure a person sees is one plain sentence and one clear action.
+    @Test func bracketFailureCopyStaysFriendlyInBothMarkets() {
+        let state = AppState()
+        let technical = ["AV", "EV", "bracket", "exposure", "bias", "AVFoundation"]
+
+        state.selectRegion(.pt)
+        #expect(state.t("camera.error.bracket") == "Não foi possível concluir esta fotografia.")
+        #expect(state.t("camera.error.retry") == "Fotografar novamente")
+
+        state.selectRegion(.br)
+        #expect(state.t("camera.error.bracket") == "Não foi possível concluir esta foto.")
+        #expect(state.t("camera.error.retry") == "Fotografar novamente")
+
+        for region in [RegionCode.pt, .br] {
+            state.selectRegion(region)
+            for error in CameraError.allCases {
+                let message = state.t(error.localizationKey)
+                #expect(message != error.localizationKey)
+                #expect(!technical.contains { message.contains($0) })
+            }
+        }
+
+        state.selectRegion(.pt)
+    }
+}
+
+/// Phase D2: real multi-exposure bracketing.
+///
+/// These tests lock the domain rules a bracket must obey — capability-driven profiles, EV 0,
+/// deterministic ordering, one camera, one geometry, local-first persistence, atomic validation
+/// and zero credit movement. Physical exposure quality is not testable here: that is verified on
+/// a real iPhone, scene by scene.
+@MainActor
+@Suite(.serialized)
+struct MultiExposureBracketTests {
+
+    // MARK: - Capability detection & profile selection
+
+    // A camera with the full ±8 EV envelope of a modern iPhone gets the whole ladder.
+    @Test func fullLadderIsSelectedWhenTheDeviceSupportsIt() {
+        let plan = CaptureProfileService.plan(for: Self.capabilities(min: -8, max: 8, bracket: 9))
+        #expect(plan.profile == .full9)
+        #expect(plan.exposureValues == [-4, -3, -2, -1, 0, 1, 2, 3, 4])
+        #expect(plan.expectedFrameCount == 9)
+        #expect(!plan.isSegmented)
+    }
+
+    // A narrower exposure range never fails the camera — it falls back, in order.
+    @Test func profileFallsBackToTheWidestSupportedLadder() {
+        let expectations: [(Double, CaptureProfile)] = [
+            (8, .full9),
+            (3.5, .standard7),
+            (2.5, .compact5),
+            (2.0, .compact5),
+            (1.5, .basic3),
+        ]
+        for (range, expected) in expectations {
+            let capabilities = Self.capabilities(min: -range, max: range, bracket: 9)
+            #expect(CaptureProfileService.profile(for: capabilities) == expected)
+        }
+    }
+
+    // BASIC_3 needs ±2 EV; a camera under that, or with no bracket at all, takes one photograph.
+    @Test func singleProfileIsUsedWhenBracketingIsUnavailable() {
+        let noBracket = Self.capabilities(min: -8, max: 8, bracket: 1, supportsBracket: false)
+        #expect(CaptureProfileService.plan(for: noBracket).profile == .single)
+        #expect(CaptureProfileService.plan(for: noBracket).exposureValues == [0])
+
+        let noRange = Self.capabilities(min: -1, max: 1, bracket: 9)
+        #expect(CaptureProfileService.profile(for: noRange) == .single)
+
+        #expect(CaptureProfileService.plan(for: .unavailable).profile == .single)
+    }
+
+    // Every ladder is defined once and every bracket ladder contains the reference exposure.
+    @Test func everyProfileCarriesTheReferenceExposure() {
+        for profile in CaptureProfile.allCases {
+            #expect(profile.includesReferenceExposure)
+            #expect(profile.exposureValues.count == profile.expectedFrameCount)
+            #expect(profile.exposureValues == profile.exposureValues.sorted())
+        }
+        #expect(CaptureProfile.full9.exposureValues.count == 9)
+        #expect(CaptureProfile.standard7.exposureValues.count == 7)
+        #expect(CaptureProfile.compact5.exposureValues.count == 5)
+        #expect(CaptureProfile.basic3.exposureValues == [-2, 0, 2])
+        #expect(CaptureProfile.single.exposureValues == [0])
+    }
+
+    // A camera that can only bracket three frames at a time still photographs the full ladder,
+    // as consecutive requests — never more frames per request than the hardware allows.
+    @Test func ladderIsSplitIntoSupportedBracketRequests() {
+        let plan = CaptureProfileService.plan(for: Self.capabilities(min: -8, max: 8, bracket: 3))
+        #expect(plan.profile == .full9)
+        #expect(plan.isSegmented)
+        #expect(plan.segments.allSatisfy { $0.count <= 3 })
+        #expect(plan.exposureValues == CaptureProfile.full9.exposureValues)
+        #expect(plan.exposureValues.contains(0))
+        #expect(plan.expectedFrameCount == 9)
+    }
+
+    // MARK: - Bundle, manifest and validation
+
+    // One shutter action produces one bundle: every frame, in order, with EV 0 and a checksum.
+    @Test func bracketBundleIsPersistedLocallyAndValidates() throws {
+        let state = AppState()
+        let property = try #require(state.properties.first)
+        let attempt = try #require(state.beginCaptureAttempt(property: property, room: .living))
+        defer {
+            state.endCaptureSequence()
+            CaptureBundleStore.delete(clientCaptureID: attempt.id)
+        }
+
+        let frames = try Self.writeLadder(.full9, clientCaptureID: attempt.id)
+        let manifest = Self.manifest(frames: frames, attempt: attempt, property: property)
+
+        #expect(frames.count == 9)
+        #expect(frames.map(\.sequenceIndex) == Array(0..<9))
+        #expect(frames.map { Int($0.requestedEV) } == CaptureProfile.full9.exposureValues)
+        #expect(frames.filter(\.isReferenceExposure).count == 1)
+        #expect(Set(frames.map(\.checksum)).count == 9)
+        #expect(frames.allSatisfy { $0.clientCaptureID == attempt.id })
+        #expect(frames.allSatisfy { $0.uploadState == .pendingUpload })
+
+        // Files are inside the app container, never in the user's photo library.
+        for frame in frames {
+            let path = CaptureBundleStore.path(for: frame)
+            #expect(FileManager.default.fileExists(atPath: path))
+            #expect(path.contains(attempt.id.uuidString))
+            #expect(CaptureBundleStore.fileSize(frame) == frame.byteCount)
+        }
+
+        try CaptureBundleStore.writeManifest(manifest)
+        #expect(CaptureBundleValidator.validate(manifest, deepVerify: true) == nil)
+
+        let reloaded = try #require(CaptureBundleStore.readManifest(clientCaptureID: attempt.id))
+        #expect(reloaded.captureProfile == .full9)
+        #expect(reloaded.expectedFrameCount == 9)
+        #expect(reloaded.actualFrameCount == 9)
+        #expect(reloaded.orderedFrames.map(\.sequenceIndex) == Array(0..<9))
+        #expect(reloaded.captureSource == .nativeReal)
+        #expect(reloaded.hdrSource == .mock)
+        #expect(reloaded.referenceFrame?.requestedEV == 0)
+    }
+
+    // An eight-frame FULL_9 is never accepted as a valid nine-frame capture.
+    @Test func incompleteBracketIsRejected() throws {
+        let state = AppState()
+        let property = try #require(state.properties.first)
+        let attempt = try #require(state.beginCaptureAttempt(property: property, room: .kitchen))
+        defer {
+            state.endCaptureSequence()
+            CaptureBundleStore.delete(clientCaptureID: attempt.id)
+        }
+
+        let frames = try Self.writeLadder(.full9, clientCaptureID: attempt.id).dropLast()
+        var manifest = Self.manifest(frames: Array(frames), attempt: attempt, property: property)
+        manifest.actualFrameCount = frames.count
+
+        #expect(CaptureBundleValidator.validate(manifest) == .frameMissing)
+
+        manifest.state = CameraError.frameMissing.bundleState
+        #expect(manifest.state == .incomplete)
+        #expect(!manifest.state.isValid)
+    }
+
+    // Without the reference exposure the bracket carries no usable HDR information.
+    @Test func bracketWithoutReferenceExposureIsRejected() throws {
+        let state = AppState()
+        let property = try #require(state.properties.first)
+        let attempt = try #require(state.beginCaptureAttempt(property: property, room: .living))
+        defer {
+            state.endCaptureSequence()
+            CaptureBundleStore.delete(clientCaptureID: attempt.id)
+        }
+
+        var frames = try Self.writeLadder(.basic3, clientCaptureID: attempt.id)
+        frames[1].requestedEV = 1
+        let manifest = Self.manifest(frames: frames, attempt: attempt, property: property, profile: .basic3)
+
+        let referenceCount = manifest.frames.filter(\.isReferenceExposure).count
+        #expect(referenceCount == 0)
+        #expect(CaptureBundleValidator.validate(manifest) == .ev0Missing)
+    }
+
+    // One camera, one geometry, one orientation — anything else is not a bracket.
+    @Test func mixedGeometryCameraOrOrientationIsRejected() throws {
+        let state = AppState()
+        let property = try #require(state.properties.first)
+        let attempt = try #require(state.beginCaptureAttempt(property: property, room: .living))
+        defer {
+            state.endCaptureSequence()
+            CaptureBundleStore.delete(clientCaptureID: attempt.id)
+        }
+
+        let frames = try Self.writeLadder(.basic3, clientCaptureID: attempt.id)
+
+        var mixedSize = frames
+        mixedSize[2].width += 40
+        #expect(
+            CaptureBundleValidator.validate(
+                Self.manifest(frames: mixedSize, attempt: attempt, property: property, profile: .basic3)
+            ) == .frameDimensionMismatch
+        )
+
+        var mixedOrientation = frames
+        mixedOrientation[1].orientation = .landscapeLeft
+        #expect(
+            CaptureBundleValidator.validate(
+                Self.manifest(frames: mixedOrientation, attempt: attempt, property: property, profile: .basic3)
+            ) == .frameOrientationMismatch
+        )
+
+        var mixedCamera = frames
+        mixedCamera[0].cameraID = "other-camera"
+        #expect(
+            CaptureBundleValidator.validate(
+                Self.manifest(frames: mixedCamera, attempt: attempt, property: property, profile: .basic3)
+            ) == .cameraChanged
+        )
+    }
+
+    // Ordering is explicit: duplicated or shuffled indexes can never reach the HDR pipeline.
+    @Test func frameOrderingIsDeterministic() throws {
+        let state = AppState()
+        let property = try #require(state.properties.first)
+        let attempt = try #require(state.beginCaptureAttempt(property: property, room: .living))
+        defer {
+            state.endCaptureSequence()
+            CaptureBundleStore.delete(clientCaptureID: attempt.id)
+        }
+
+        let frames = try Self.writeLadder(.compact5, clientCaptureID: attempt.id)
+        let shuffled = Self.manifest(
+            frames: frames.shuffled(), attempt: attempt, property: property, profile: .compact5
+        )
+        #expect(shuffled.orderedFrames.map(\.sequenceIndex) == Array(0..<5))
+        #expect(shuffled.orderedFrames.map { Int($0.requestedEV) } == CaptureProfile.compact5.exposureValues)
+        #expect(CaptureBundleValidator.validate(shuffled) == nil)
+
+        var duplicated = frames
+        duplicated[3].sequenceIndex = 2
+        #expect(
+            CaptureBundleValidator.validate(
+                Self.manifest(frames: duplicated, attempt: attempt, property: property, profile: .compact5)
+            ) == .manifestInvalid
+        )
+    }
+
+    // Frames never cross attempts: capture A can never be completed with a frame from capture B.
+    @Test func framesNeverCrossAttempts() throws {
+        let state = AppState()
+        let property = try #require(state.properties.first)
+        let attemptA = try #require(state.beginCaptureAttempt(property: property, room: .living))
+        state.endCaptureSequence()
+        let attemptB = try #require(state.beginCaptureAttempt(property: property, room: .living))
+        defer {
+            state.endCaptureSequence()
+            CaptureBundleStore.delete(clientCaptureID: attemptA.id)
+            CaptureBundleStore.delete(clientCaptureID: attemptB.id)
+        }
+
+        var framesA = try Self.writeLadder(.basic3, clientCaptureID: attemptA.id)
+        let framesB = try Self.writeLadder(.basic3, clientCaptureID: attemptB.id)
+        framesA[2] = framesB[2]
+
+        #expect(attemptA.id != attemptB.id)
+        #expect(
+            CaptureBundleValidator.validate(
+                Self.manifest(frames: framesA, attempt: attemptA, property: property, profile: .basic3)
+            ) == .manifestInvalid
+        )
+    }
+
+    // MARK: - Registration, credits and recovery
+
+    // A real bracket becomes exactly one capture, keeps its frames, and costs no credits.
+    @Test func registeringABracketKeepsOneCaptureAndNoCreditMovement() throws {
+        let state = AppState()
+        state.preparationSeconds = 0.05
+        let property = try #require(state.properties.first)
+        let before = state.captures.count
+        let balance = state.wallet.total
+        let transactions = state.transactions.count
+
+        let attempt = try #require(state.beginCaptureAttempt(property: property, room: .living))
+        defer { CaptureBundleStore.delete(clientCaptureID: attempt.id) }
+
+        let frames = try Self.writeLadder(.full9, clientCaptureID: attempt.id)
+        var manifest = Self.manifest(frames: frames, attempt: attempt, property: property)
+        manifest.state = .localReady
+        try CaptureBundleStore.writeManifest(manifest)
+
+        #expect(state.captureStageLabel == "CAPTURING")
+        state.beginLocalValidation()
+        #expect(state.captureStageLabel == "LOCAL_VALIDATING")
+
+        let capture = state.registerCapture(
+            attempt: attempt,
+            property: property,
+            room: .living,
+            frameCount: manifest.actualFrameCount,
+            localFile: manifest.referenceFrame?.localPhotoFile,
+            manifest: manifest
+        )
+        let replay = state.registerCapture(
+            attempt: attempt,
+            property: property,
+            room: .living,
+            frameCount: manifest.actualFrameCount,
+            localFile: manifest.referenceFrame?.localPhotoFile,
+            manifest: manifest
+        )
+        state.endCaptureSequence()
+
+        #expect(capture.id == replay.id)
+        #expect(state.captures.count == before + 1)
+        #expect(capture.frameCount == 9)
+        #expect(capture.frames.count == 9)
+        #expect(capture.hasLocalOriginal)
+        #expect(capture.captureSource == .nativeReal)
+        // Pixels are real, the master is still simulated — the two stay distinct.
+        #expect(capture.hdrSource == .mock)
+        #expect(state.captureStageLabel == "LOCAL_READY")
+
+        // Zero AI credits: photography is always included.
+        #expect(state.wallet.total == balance)
+        #expect(state.transactions.count == transactions)
+
+        // The bundle now knows which capture it became.
+        let stored = try #require(CaptureBundleStore.readManifest(clientCaptureID: attempt.id))
+        #expect(stored.captureID == capture.id)
+    }
+
+    // A capture whose frames and manifest were safely stored survives a relaunch.
+    @Test func persistedCaptureIsRestoredAfterRelaunch() throws {
+        let state = AppState()
+        let property = try #require(state.properties.first)
+        let attempt = try #require(state.beginCaptureAttempt(property: property, room: .bedroom))
+        state.endCaptureSequence()
+        defer { CaptureBundleStore.delete(clientCaptureID: attempt.id) }
+
+        let frames = try Self.writeLadder(.compact5, clientCaptureID: attempt.id)
+        var manifest = Self.manifest(
+            frames: frames, attempt: attempt, property: property, profile: .compact5
+        )
+        manifest.state = .localReady
+        manifest.completedAt = .now
+        try CaptureBundleStore.writeManifest(manifest)
+
+        #expect(!state.captures.contains { $0.clientCaptureID == attempt.id })
+        state.restorePendingCaptures()
+
+        let restored = try #require(state.captures.first { $0.clientCaptureID == attempt.id })
+        #expect(restored.isPendingSync)
+        #expect(restored.frameCount == 5)
+        #expect(restored.room == .bedroom)
+        #expect(restored.propertyID == property.id)
+        #expect(restored.hasLocalOriginal)
+
+        // Restoring twice never duplicates a capture.
+        state.restorePendingCaptures()
+        #expect(state.captures.filter { $0.clientCaptureID == attempt.id }.count == 1)
+    }
+
+    // An interrupted bracket is evidence, not a capture: it is never restored.
+    @Test func interruptedBundleIsNeverRestored() throws {
+        let state = AppState()
+        let property = try #require(state.properties.first)
+        let attempt = try #require(state.beginCaptureAttempt(property: property, room: .office))
+        state.endCaptureSequence()
+        defer { CaptureBundleStore.delete(clientCaptureID: attempt.id) }
+
+        let frames = try Self.writeLadder(.basic3, clientCaptureID: attempt.id)
+        var manifest = Self.manifest(
+            frames: Array(frames.prefix(2)), attempt: attempt, property: property, profile: .basic3
+        )
+        manifest.actualFrameCount = 2
+        manifest.state = CameraError.captureInterrupted.bundleState
+        manifest.failureCode = CameraError.captureInterrupted.code
+        try CaptureBundleStore.writeManifest(manifest)
+
+        state.restorePendingCaptures()
+        #expect(!state.captures.contains { $0.clientCaptureID == attempt.id })
+
+        let stored = try #require(CaptureBundleStore.readManifest(clientCaptureID: attempt.id))
+        #expect(stored.state == .interrupted)
+        #expect(stored.failureCode == "CAPTURE_INTERRUPTED")
+        // Debugging evidence is kept: nothing is deleted eagerly during development.
+        #expect(CaptureBundleStore.cleanupIncomplete(olderThan: 60 * 60 * 24) == 0)
+    }
+
+    // MARK: - Helpers
+
+    private static func capabilities(
+        min: Double,
+        max: Double,
+        bracket: Int,
+        supportsBracket: Bool = true
+    ) -> CameraExposureCapabilities {
+        CameraExposureCapabilities(
+            deviceModel: "iPhone16,1",
+            systemVersion: "iOS 26.0",
+            activeLens: "Rear Wide",
+            cameraID: "test-camera",
+            activeFormat: "4032×3024",
+            minExposureBias: min,
+            maxExposureBias: max,
+            maxBracketCount: bracket,
+            supportsBracketCapture: supportsBracket && bracket >= 2,
+            supportsExposureLock: true,
+            supportsCustomExposure: true,
+            supportsFocusLock: true,
+            supportsWhiteBalanceLock: true,
+            supportsLensStabilization: true
+        )
+    }
+
+    /// Writes a real ladder of files, one visibly different image per exposure.
+    private static func writeLadder(
+        _ profile: CaptureProfile,
+        clientCaptureID: UUID
+    ) throws -> [CaptureFrame] {
+        try profile.exposureValues.enumerated().map { index, ev in
+            let brightness = 0.5 + Double(ev) * 0.1
+            var frame = try CaptureBundleStore.writeFrame(
+                photoData: jpeg(brightness: brightness),
+                clientCaptureID: clientCaptureID,
+                sequenceIndex: index,
+                requestedEV: Double(ev),
+                orientation: .portrait,
+                cameraID: "test-camera",
+                lensType: "Rear Wide"
+            )
+            frame.actualExposureBias = Double(ev)
+            frame.iso = 100 * Double(index + 1)
+            frame.exposureDurationSeconds = 1.0 / Double(120 - index * 10)
+            frame.aperture = 1.78
+            return frame
+        }
+    }
+
+    private static func manifest(
+        frames: [CaptureFrame],
+        attempt: CaptureAttempt,
+        property: Property,
+        profile: CaptureProfile = .full9
+    ) -> CaptureManifest {
+        CaptureManifest(
+            captureID: nil,
+            clientCaptureID: attempt.id,
+            organizationID: "Test Workspace",
+            propertyID: property.id,
+            roomID: attempt.room.rawValue,
+            device: "iPhone16,1",
+            iOSVersion: "iOS 26.0",
+            appVersion: "1.0.0 (1)",
+            cameraID: "test-camera",
+            lensType: "Rear Wide",
+            captureProfile: profile,
+            expectedFrameCount: profile.expectedFrameCount,
+            actualFrameCount: frames.count,
+            segmentCount: 1,
+            orientation: .portrait,
+            focusLockSucceeded: .succeeded,
+            whiteBalanceLockSucceeded: .succeeded,
+            state: .localValidating,
+            startedAt: attempt.startedAt,
+            completedAt: nil,
+            firstFrameSeconds: 0.2,
+            bracketSeconds: 1.4,
+            persistSeconds: 0.3,
+            manifestSeconds: 0.02,
+            frames: frames
+        )
+    }
+
+    /// A 4:3 image, dark for negative exposures and bright for positive ones.
+    private static func jpeg(brightness: Double) -> Data {
+        let size = CGSize(width: 400, height: 300)
+        let level = Swift.max(0.02, Swift.min(0.98, brightness))
+        let image = UIGraphicsImageRenderer(size: size).image { context in
+            UIColor(white: level, alpha: 1).setFill()
+            context.fill(CGRect(origin: .zero, size: size))
+        }
+        return image.jpegData(compressionQuality: 0.9) ?? Data()
+    }
 }

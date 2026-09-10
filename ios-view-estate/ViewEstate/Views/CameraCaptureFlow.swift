@@ -29,13 +29,14 @@ struct CameraCaptureFlow: View {
                 property: property,
                 room: $room,
                 previewCapturing: previewCapturing,
-                onCaptured: { attempt, frameCount, localFile in
+                onCaptured: { attempt, outcome in
                     let capture = state.registerCapture(
                         attempt: attempt,
                         property: property,
                         room: attempt.room,
-                        frameCount: frameCount,
-                        localFile: localFile
+                        frameCount: outcome.frameCount,
+                        localFile: outcome.localFile,
+                        manifest: outcome.manifest
                     )
                     withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) {
                         completedCapture = capture
@@ -85,18 +86,26 @@ struct CameraCaptureFlow: View {
     }
 }
 
+/// Everything one finished shutter action hands back to the capture flow.
+struct CaptureOutcome: Sendable {
+    var frameCount: Int
+    /// The reference exposure (EV 0) of a real bracket.
+    var localFile: LocalPhotoFile?
+    /// Local record of every real exposure. Absent for the simulated prototype.
+    var manifest: CaptureManifest?
+}
+
 /// The professional capture tool.
 ///
 /// The interface is the approved one in both modes. With `camera_native_enabled` OFF the
 /// viewfinder is a faithful UI simulation; with it ON the real rear camera runs behind exactly
-/// the same interface and one shutter tap takes one real photograph.
+/// the same interface and one shutter tap photographs a real multi-exposure bracket.
 struct CameraPrototypeView: View {
     let property: Property
     @Binding var room: RoomType
     var previewCapturing: Bool = false
-    /// Delivers the finished capture together with the attempt that produced it and, for native
-    /// captures, the original photograph stored on the device.
-    let onCaptured: (CaptureAttempt, Int, LocalPhotoFile?) -> Void
+    /// Delivers the finished capture together with the attempt that produced it.
+    let onCaptured: (CaptureAttempt, CaptureOutcome) -> Void
     let onClose: () -> Void
 
     @Environment(AppState.self) private var state
@@ -110,11 +119,12 @@ struct CameraPrototypeView: View {
     @State private var shutterPulse = false
     @State private var errorMessage: String?
 
-    private let simulatedExposures: [Int] = [-4, -3, -2, -1, 0, 1, 2, 3, 4]
+    /// The prototype always shows the full ladder; profiles are a real-camera concern.
+    private let simulatedExposures: [Int] = CaptureProfile.full9.exposureValues
 
-    /// Native capture proves ONE real photograph first: no bracket, no HDR.
+    /// In native mode the ladder is whatever this device can genuinely photograph.
     private var exposures: [Int] {
-        isNative ? [0] : simulatedExposures
+        isNative ? camera.plan.exposureValues : simulatedExposures
     }
 
     private var isNative: Bool {
@@ -142,6 +152,8 @@ struct CameraPrototypeView: View {
             state.cameraDiagnostics.mode = state.cameraMode
             state.cameraDiagnostics.access = camera.access
             state.cameraDiagnostics.setup = camera.setup
+            state.cameraDiagnostics.capabilities = camera.capabilities
+            state.cameraDiagnostics.plan = camera.plan
             if let failure = camera.failure, failure != .permissionDenied {
                 errorMessage = state.t(failure.localizationKey)
                 state.cameraDiagnostics.lastErrorCode = failure.code
@@ -153,6 +165,8 @@ struct CameraPrototypeView: View {
             case .active:
                 Task { await camera.start() }
             case .background, .inactive:
+                // A sequence that loses the foreground can never be completed as a success.
+                camera.markInterrupted()
                 camera.stop()
             @unknown default:
                 break
@@ -322,7 +336,7 @@ struct CameraPrototypeView: View {
                 .animation(.easeOut(duration: 0.12), value: activeFrame)
             }
 
-            Text(isNative ? "FOTO · 1" : "HDR · \(exposures.count)")
+            Text(exposures.count > 1 ? "HDR · \(exposures.count)" : "FOTO · 1")
                 .font(VE.Font.mono)
                 .foregroundStyle(VE.textSecondary)
                 .padding(.horizontal, 8)
@@ -431,7 +445,7 @@ struct CameraPrototypeView: View {
                 .foregroundStyle(VE.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
-            Button(state.t("photo.action.retry")) {
+            Button(state.t("camera.error.retry")) {
                 errorMessage = nil
                 camera.clearFailure()
             }
@@ -514,7 +528,7 @@ struct CameraPrototypeView: View {
 
     // MARK: - Capture
 
-    /// READY → CAPTURING → LOCAL_READY.
+    /// READY → CAPTURING → LOCAL_VALIDATING → LOCAL_READY.
     ///
     /// One tap owns one capture attempt in both modes. The shutter, the room chips and the lens
     /// control stay locked for its duration, and the attempt id — never a time window — is what
@@ -524,7 +538,10 @@ struct CameraPrototypeView: View {
         if isNative { await runNativeCapture() } else { await runSimulatedSequence() }
     }
 
-    /// Native single photograph: real capture, stored locally, then the approved confirmation.
+    /// Native capture: one tap photographs the whole exposure ladder this device supports,
+    /// persists every frame, validates the bundle and only then shows the approved confirmation.
+    /// The person holding the phone sees the same subtle feedback as always — never a technical
+    /// progress read-out of individual exposures.
     private func runNativeCapture() async {
         guard camera.access.isAuthorized else {
             errorMessage = state.t("camera.permission.body")
@@ -534,20 +551,52 @@ struct CameraPrototypeView: View {
 
         isCapturing = true
         errorMessage = nil
-        withAnimation(.easeOut(duration: 0.1)) { activeFrame = 0 }
+        let feedback = Task { await sweepLadder() }
+        defer { feedback.cancel() }
 
         do {
-            let result = try await camera.capturePhoto(clientCaptureID: attempt.id)
-            state.cameraDiagnostics.lastCaptureSeconds = result.seconds
+            let result = try await camera.captureBracket(clientCaptureID: attempt.id)
+            state.beginLocalValidation()
+            let manifest = try CaptureManifestBuilder.finalize(
+                result: result,
+                attempt: attempt,
+                property: property,
+                organizationID: state.organizationName
+            )
+            state.cameraDiagnostics.lastCaptureSeconds = result.bracketSeconds
+            state.cameraDiagnostics.lastManifest = manifest
+            state.cameraDiagnostics.plan = camera.plan
+            state.cameraDiagnostics.capabilities = camera.capabilities
             state.cameraDiagnostics.lastErrorCode = nil
             finishCapturing()
-            onCaptured(attempt, 1, result.file)
+            onCaptured(
+                attempt,
+                CaptureOutcome(
+                    frameCount: manifest.actualFrameCount,
+                    localFile: manifest.referenceFrame?.localPhotoFile,
+                    manifest: manifest
+                )
+            )
+        } catch let failure as BracketCaptureFailure {
+            // Whatever reached the device is kept as an incomplete attempt — never as a capture.
+            let manifest = CaptureManifestBuilder.recordFailure(
+                failure,
+                attempt: attempt,
+                property: property,
+                organizationID: state.organizationName
+            )
+            report(failure.code, manifest: manifest)
         } catch {
-            let failure = (error as? CameraError) ?? .captureFailed
-            state.cameraDiagnostics.lastErrorCode = failure.code
-            errorMessage = state.t(failure.localizationKey)
-            finishCapturing()
+            let code = (error as? CameraError) ?? .bracketCaptureFailed
+            report(code, manifest: CaptureBundleStore.readManifest(clientCaptureID: attempt.id))
         }
+    }
+
+    private func report(_ code: CameraError, manifest: CaptureManifest?) {
+        state.cameraDiagnostics.lastErrorCode = code.code
+        state.cameraDiagnostics.lastManifest = manifest
+        errorMessage = state.t(code.localizationKey)
+        finishCapturing()
     }
 
     /// The approved simulation: one tap runs the whole nine-exposure sequence.
@@ -557,7 +606,19 @@ struct CameraPrototypeView: View {
         isCapturing = true
         await animateBracket()
         finishCapturing()
-        onCaptured(attempt, simulatedExposures.count, nil)
+        onCaptured(attempt, CaptureOutcome(frameCount: simulatedExposures.count))
+    }
+
+    /// Subtle capture feedback while the real bracket runs: the same hairline ladder animation
+    /// the approved design already uses, never a per-exposure progress screen.
+    private func sweepLadder() async {
+        withAnimation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true)) { shutterPulse = true }
+        while !Task.isCancelled {
+            for value in exposures where !Task.isCancelled {
+                withAnimation(.easeOut(duration: 0.1)) { activeFrame = value }
+                try? await Task.sleep(for: .milliseconds(110))
+            }
+        }
     }
 
     private func finishCapturing() {

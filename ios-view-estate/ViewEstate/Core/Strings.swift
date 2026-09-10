@@ -145,6 +145,8 @@ enum Strings {
         "camera.error.init": "Não foi possível abrir a câmara. Feche e volte a abrir a câmara.",
         "camera.error.capture": "Não foi possível tirar a fotografia. Tente novamente.",
         "camera.error.save": "Não foi possível guardar a fotografia no dispositivo.",
+        "camera.error.bracket": "Não foi possível concluir esta fotografia.",
+        "camera.error.retry": "Fotografar novamente",
 
         // Capture setup
         "capture.pick.property": "Selecionar imóvel",
@@ -412,6 +414,8 @@ enum Strings {
         "camera.error.init": "Não foi possível abrir a câmera. Feche e abra a câmera novamente.",
         "camera.error.capture": "Não foi possível tirar a foto. Tente novamente.",
         "camera.error.save": "Não foi possível salvar a foto no dispositivo.",
+        "camera.error.bracket": "Não foi possível concluir esta foto.",
+        "camera.error.retry": "Fotografar novamente",
 
         "capture.pick.property": "Selecionar imóvel",
         "capture.pick.room": "Selecionar cômodo",

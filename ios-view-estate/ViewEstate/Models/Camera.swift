@@ -39,23 +39,42 @@ enum CameraAccess: String, Sendable {
 }
 
 /// Normalised camera failures. A raw AVFoundation error is never shown to a user.
-enum CameraError: String, Error, Sendable {
+enum CameraError: String, Error, Sendable, CaseIterable {
     case permissionDenied = "CAMERA_PERMISSION_DENIED"
     case initializationFailed = "CAMERA_INITIALIZATION_FAILED"
     case captureFailed = "PHOTO_CAPTURE_FAILED"
     case localSaveFailed = "LOCAL_SAVE_FAILED"
+    case bracketNotSupported = "BRACKET_NOT_SUPPORTED"
+    case exposureRangeUnsupported = "EXPOSURE_RANGE_UNSUPPORTED"
+    case bracketCaptureFailed = "BRACKET_CAPTURE_FAILED"
+    case frameMissing = "FRAME_MISSING"
+    case frameSaveFailed = "FRAME_SAVE_FAILED"
+    case frameDimensionMismatch = "FRAME_DIMENSION_MISMATCH"
+    case frameOrientationMismatch = "FRAME_ORIENTATION_MISMATCH"
+    case cameraChanged = "CAMERA_CHANGED"
+    case captureInterrupted = "CAPTURE_INTERRUPTED"
+    case ev0Missing = "EV0_MISSING"
+    case manifestInvalid = "MANIFEST_INVALID"
 
     /// Stable code for logs and the developer panel.
     var code: String { rawValue }
 
-    /// User-facing message key. Friendly copy, no technical vocabulary.
+    /// User-facing message key. Friendly copy, no technical vocabulary — a person is told the
+    /// photograph could not be completed and is offered another attempt, never an exposure
+    /// bias or an AVFoundation domain.
     var localizationKey: String {
         switch self {
         case .permissionDenied: "camera.permission.body"
         case .initializationFailed: "camera.error.init"
         case .captureFailed: "camera.error.capture"
         case .localSaveFailed: "camera.error.save"
+        default: "camera.error.bracket"
         }
+    }
+
+    /// The bundle state a failed attempt is recorded with.
+    var bundleState: CaptureBundleState {
+        self == .captureInterrupted ? .interrupted : .incomplete
     }
 }
 
@@ -101,6 +120,8 @@ enum CaptureOrientation: String, Sendable, Codable {
 /// original is never re-encoded or rotated on disk.
 struct LocalPhotoFile: Hashable, Sendable, Codable {
     var fileName: String
+    /// Capture bundle this file lives in. `nil` means the flat originals folder.
+    var bundleID: UUID?
     /// Pixel dimensions as recorded by the sensor.
     var pixelWidth: Int
     var pixelHeight: Int
@@ -149,6 +170,7 @@ struct CameraSetup: Sendable {
     var deviceID: String
     var lens: String
     var captureResolution: String
+    var systemVersion: String = ""
 }
 
 /// Everything the developer panel shows about the camera. Never surfaced to a normal user.
@@ -156,9 +178,19 @@ struct CameraDiagnostics: Sendable {
     var mode: CameraMode = .simulated
     var access: CameraAccess = .unknown
     var setup: CameraSetup?
+    /// What the real camera reported it can do before a ladder was planned.
+    var capabilities: CameraExposureCapabilities?
+    /// The ladder the next shutter action will photograph.
+    var plan: BracketPlan?
     var lastFile: LocalPhotoFile?
+    /// Complete record of the most recent shutter action.
+    var lastManifest: CaptureManifest?
     var lastCaptureSeconds: Double?
     var lastErrorCode: String?
+
+    /// Real pixels, simulated master. The two are never confused internally.
+    var captureSource: CaptureSource { mode.isNative ? .nativeReal : .simulated }
+    var hdrSource: HDRSource { FeatureFlags.hdrProcessingEnabled ? .real : .mock }
 
     var captureDurationDescription: String? {
         guard let lastCaptureSeconds else { return nil }
