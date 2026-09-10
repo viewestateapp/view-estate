@@ -29,12 +29,13 @@ struct CameraCaptureFlow: View {
                 property: property,
                 room: $room,
                 previewCapturing: previewCapturing,
-                onCaptured: { attempt, frameCount in
+                onCaptured: { attempt, frameCount, localFile in
                     let capture = state.registerCapture(
                         attempt: attempt,
                         property: property,
                         room: attempt.room,
-                        frameCount: frameCount
+                        frameCount: frameCount,
+                        localFile: localFile
                     )
                     withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) {
                         completedCapture = capture
@@ -84,25 +85,41 @@ struct CameraCaptureFlow: View {
     }
 }
 
-/// Visual prototype of the professional capture tool. No camera hardware is accessed:
-/// the exposure sequence, stability read-out and shutter are a faithful UI simulation.
+/// The professional capture tool.
+///
+/// The interface is the approved one in both modes. With `camera_native_enabled` OFF the
+/// viewfinder is a faithful UI simulation; with it ON the real rear camera runs behind exactly
+/// the same interface and one shutter tap takes one real photograph.
 struct CameraPrototypeView: View {
     let property: Property
     @Binding var room: RoomType
     var previewCapturing: Bool = false
-    /// Delivers the finished sequence together with the attempt that produced it.
-    let onCaptured: (CaptureAttempt, Int) -> Void
+    /// Delivers the finished capture together with the attempt that produced it and, for native
+    /// captures, the original photograph stored on the device.
+    let onCaptured: (CaptureAttempt, Int, LocalPhotoFile?) -> Void
     let onClose: () -> Void
 
     @Environment(AppState.self) private var state
+    @Environment(\.scenePhase) private var scenePhase
 
+    @State private var camera = CameraService()
     @State private var isCapturing = false
     @State private var activeFrame: Int?
     @State private var isStable = true
     @State private var levelOffset: CGFloat = 0
     @State private var shutterPulse = false
+    @State private var errorMessage: String?
 
-    private let exposures: [Int] = [-4, -3, -2, -1, 0, 1, 2, 3, 4]
+    private let simulatedExposures: [Int] = [-4, -3, -2, -1, 0, 1, 2, 3, 4]
+
+    /// Native capture proves ONE real photograph first: no bracket, no HDR.
+    private var exposures: [Int] {
+        isNative ? [0] : simulatedExposures
+    }
+
+    private var isNative: Bool {
+        state.cameraMode.isNative && !previewCapturing
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -119,6 +136,29 @@ struct CameraPrototypeView: View {
                 await animateBracket()
             }
         }
+        .task(id: isNative) {
+            guard isNative else { return }
+            await camera.start()
+            state.cameraDiagnostics.mode = state.cameraMode
+            state.cameraDiagnostics.access = camera.access
+            state.cameraDiagnostics.setup = camera.setup
+            if let failure = camera.failure, failure != .permissionDenied {
+                errorMessage = state.t(failure.localizationKey)
+                state.cameraDiagnostics.lastErrorCode = failure.code
+            }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            guard isNative else { return }
+            switch phase {
+            case .active:
+                Task { await camera.start() }
+            case .background, .inactive:
+                camera.stop()
+            @unknown default:
+                break
+            }
+        }
+        .onDisappear { camera.stop() }
     }
 
     // MARK: - Context
@@ -149,7 +189,7 @@ struct CameraPrototypeView: View {
 
             statusChip(
                 text: isCapturing ? state.t("camera.capturing") : state.t("camera.ready"),
-                tint: isCapturing ? VE.copper : VE.success,
+                tint: isCapturing ? VE.copper : (isCameraLive ? VE.success : VE.textSecondary),
                 filled: true
             )
             if !state.isOnline {
@@ -193,13 +233,7 @@ struct CameraPrototypeView: View {
 
                 Color.black
                     .frame(width: width, height: height)
-                    .overlay {
-                        Image(room.placeholderImage)
-                            .resizable()
-                            .aspectRatio(contentMode: .fill)
-                            .opacity(frameBrightness)
-                            .allowsHitTesting(false)
-                    }
+                    .overlay { viewfinderContent }
                     .overlay { framingGuides }
                     .overlay { levelIndicator(width: width) }
                     .clipShape(.rect(cornerRadius: 4))
@@ -213,6 +247,62 @@ struct CameraPrototypeView: View {
         }
         .frame(maxHeight: .infinity)
         .padding(.horizontal, VE.Space.m)
+    }
+
+    /// The live rear camera in native mode, the reference frame in simulated mode, and a
+    /// friendly explanation when iOS is holding camera access back.
+    @ViewBuilder
+    private var viewfinderContent: some View {
+        if isNative, camera.access.needsSystemSettings {
+            permissionState
+        } else if isNative {
+            CameraPreview(service: camera)
+                .allowsHitTesting(false)
+                .overlay {
+                    if !camera.isRunning {
+                        ProgressView()
+                            .tint(VE.textSecondary)
+                    }
+                }
+        } else {
+            Image(room.placeholderImage)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+                .opacity(frameBrightness)
+                .allowsHitTesting(false)
+        }
+    }
+
+    private var permissionState: some View {
+        VStack(spacing: VE.Space.m) {
+            Image(systemName: "camera.fill")
+                .font(.system(size: 30, weight: .medium))
+                .foregroundStyle(VE.textSecondary)
+            VStack(spacing: 6) {
+                Text(state.t("camera.permission.title"))
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(VE.textPrimary)
+                Text(state.t("camera.permission.body"))
+                    .font(VE.Font.body)
+                    .foregroundStyle(VE.textSecondary)
+                    .multilineTextAlignment(.center)
+            }
+            Button {
+                camera.openSystemSettings()
+            } label: {
+                Text(state.t("camera.permission.cta"))
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(VE.copper)
+                    .padding(.horizontal, VE.Space.m)
+                    .padding(.vertical, 11)
+                    .background {
+                        Capsule().strokeBorder(VE.copper.opacity(0.5), lineWidth: 1)
+                    }
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("camera.openSettings")
+        }
+        .padding(VE.Space.l)
     }
 
     /// Advanced, ignorable technical information: a hairline exposure ladder.
@@ -232,7 +322,7 @@ struct CameraPrototypeView: View {
                 .animation(.easeOut(duration: 0.12), value: activeFrame)
             }
 
-            Text("HDR · \(exposures.count)")
+            Text(isNative ? "FOTO · 1" : "HDR · \(exposures.count)")
                 .font(VE.Font.mono)
                 .foregroundStyle(VE.textSecondary)
                 .padding(.horizontal, 8)
@@ -311,7 +401,52 @@ struct CameraPrototypeView: View {
 
     // MARK: - Controls
 
+    private var isCameraLive: Bool {
+        isNative ? camera.isRunning : true
+    }
+
+    private var canCapture: Bool {
+        guard !isCapturing else { return false }
+        return isNative ? camera.isRunning : true
+    }
+
     private var controls: some View {
+        VStack(spacing: VE.Space.s) {
+            if let errorMessage {
+                errorBanner(errorMessage)
+            }
+            controlRow
+        }
+        .padding(.top, VE.Space.s)
+        .padding(.bottom, VE.Space.m)
+    }
+
+    private func errorBanner(_ message: String) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(VE.warning)
+            Text(message)
+                .font(VE.Font.caption)
+                .foregroundStyle(VE.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            Button(state.t("photo.action.retry")) {
+                errorMessage = nil
+                camera.clearFailure()
+            }
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(VE.copper)
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, VE.Space.m)
+        .padding(.vertical, 11)
+        .background(VE.surface, in: .rect(cornerRadius: VE.Radius.tile))
+        .padding(.horizontal, VE.Space.m)
+        .accessibilityIdentifier("camera.error")
+    }
+
+    private var controlRow: some View {
         HStack {
             lastThumbnail
             Spacer()
@@ -328,16 +463,12 @@ struct CameraPrototypeView: View {
             .accessibilityLabel("Alternar câmara")
         }
         .padding(.horizontal, 28)
-        .padding(.top, VE.Space.s)
-        .padding(.bottom, VE.Space.m)
     }
 
     private var lastThumbnail: some View {
         Group {
             if let capture = state.captures.first {
-                Image(capture.image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
+                CaptureImage(capture: capture)
                     .frame(width: 52, height: 52)
                     .clipShape(.rect(cornerRadius: 8))
                     .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(VE.border, lineWidth: 1))
@@ -352,7 +483,7 @@ struct CameraPrototypeView: View {
 
     private var shutter: some View {
         Button {
-            Task { await runSequence() }
+            Task { await runCapture() }
         } label: {
             ZStack {
                 Circle()
@@ -376,24 +507,64 @@ struct CameraPrototypeView: View {
             }
         }
         .buttonStyle(.plain)
-        .disabled(isCapturing)
+        .disabled(!canCapture)
+        .accessibilityIdentifier("camera.shutter")
         .accessibilityLabel(state.t("home.cta.capture"))
     }
 
-    // MARK: - Simulated bracket
+    // MARK: - Capture
 
-    /// One tap runs the whole nine-exposure sequence under a single capture attempt.
-    /// The shutter stays locked for its duration; the attempt id — not a time window —
-    /// is what makes the resulting registration idempotent.
-    private func runSequence() async {
-        guard !isCapturing, !previewCapturing else { return }
+    /// READY → CAPTURING → LOCAL_READY.
+    ///
+    /// One tap owns one capture attempt in both modes. The shutter, the room chips and the lens
+    /// control stay locked for its duration, and the attempt id — never a time window — is what
+    /// makes the resulting registration idempotent.
+    private func runCapture() async {
+        guard canCapture, !previewCapturing else { return }
+        if isNative { await runNativeCapture() } else { await runSimulatedSequence() }
+    }
+
+    /// Native single photograph: real capture, stored locally, then the approved confirmation.
+    private func runNativeCapture() async {
+        guard camera.access.isAuthorized else {
+            errorMessage = state.t("camera.permission.body")
+            return
+        }
+        guard let attempt = state.beginCaptureAttempt(property: property, room: room) else { return }
+
+        isCapturing = true
+        errorMessage = nil
+        withAnimation(.easeOut(duration: 0.1)) { activeFrame = 0 }
+
+        do {
+            let result = try await camera.capturePhoto(clientCaptureID: attempt.id)
+            state.cameraDiagnostics.lastCaptureSeconds = result.seconds
+            state.cameraDiagnostics.lastErrorCode = nil
+            finishCapturing()
+            onCaptured(attempt, 1, result.file)
+        } catch {
+            let failure = (error as? CameraError) ?? .captureFailed
+            state.cameraDiagnostics.lastErrorCode = failure.code
+            errorMessage = state.t(failure.localizationKey)
+            finishCapturing()
+        }
+    }
+
+    /// The approved simulation: one tap runs the whole nine-exposure sequence.
+    private func runSimulatedSequence() async {
         guard let attempt = state.beginCaptureAttempt(property: property, room: room) else { return }
 
         isCapturing = true
         await animateBracket()
+        finishCapturing()
+        onCaptured(attempt, simulatedExposures.count, nil)
+    }
+
+    private func finishCapturing() {
+        withAnimation(.easeOut(duration: 0.2)) { activeFrame = nil }
         isCapturing = false
+        shutterPulse = false
         state.endCaptureSequence()
-        onCaptured(attempt, exposures.count)
     }
 
     private func animateBracket() async {

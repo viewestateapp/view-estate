@@ -5,6 +5,7 @@
 
 import Foundation
 import Testing
+import UIKit
 @testable import ViewEstate
 
 /// Capture flow domain tests. They lock the approved rules: one shutter action is one
@@ -197,6 +198,192 @@ struct CaptureFlowTests {
     }
 }
 
+/// Native camera spike: the development test property, local storage of one real original and
+/// the orientation contract. No AVFoundation session is started here — hardware behaviour is
+/// validated on a physical iPhone.
+@MainActor
+struct NativeCaptureTests {
+
+    // The reference property exists, is development-only, and its SketchUp source is immutable.
+    @Test func developmentPropertyRegistersImmutableSketchUpSource() throws {
+        let state = AppState()
+        let property = try #require(state.properties.first { $0.title == "Residência Sergio" })
+
+        #expect(property.type == .house)
+        #expect(property.lifecycle == .developmentTest)
+        #expect(property.isDevelopmentProperty)
+
+        let asset = try #require(property.sourceAsset)
+        #expect(asset.fileName == "sergio.skp")
+        #expect(asset.format == .sketchupModel)
+        #expect(asset.isImmutable)
+        // A 3D source is a reference asset: it can never stand in for photographic input.
+        #expect(!asset.canFeedCamera)
+        #expect(!asset.format.isPhotographic)
+    }
+
+    // Future USDZ / GLB derivatives are prepared for, but nothing is converted yet.
+    @Test func sourceAssetDerivativesArePreparedButNotGenerated() throws {
+        let property = DevFixtures.sergioResidence()
+        let asset = try #require(property.sourceAsset)
+
+        #expect(asset.availableDerivatives.isEmpty)
+        for format in SourceAssetFormat.plannedConversionTargets {
+            let derivative = try #require(asset.derivative(format))
+            #expect(derivative.state == .notGenerated)
+            #expect(derivative.parentAssetID == asset.id)
+            #expect(derivative.fileName == nil)
+        }
+    }
+
+    // Rotation angles map to device orientation in both directions.
+    @Test func captureOrientationMapsRotationAngles() {
+        let expectations: [(CGFloat, CaptureOrientation)] = [
+            (0, .landscapeRight),
+            (90, .portrait),
+            (180, .landscapeLeft),
+            (270, .portraitUpsideDown),
+        ]
+        for (angle, orientation) in expectations {
+            #expect(CaptureOrientation(videoRotationAngle: angle) == orientation)
+            #expect(orientation.videoRotationAngle == angle)
+        }
+    }
+
+    // A real photograph is written into the app container and the capture keeps the file,
+    // the property and the room together — with a local record that needs no connectivity.
+    @Test func nativeCaptureStoresOriginalLocallyWithPropertyAndRoom() throws {
+        let state = AppState()
+        state.preparationSeconds = 0.05
+        let property = try #require(state.properties.first { $0.isDevelopmentProperty })
+
+        let attempt = try #require(state.beginCaptureAttempt(property: property, room: .kitchen))
+        let file = try CaptureFileStore.saveOriginal(
+            photoData: Self.sampleJPEG(width: 400, height: 300),
+            clientCaptureID: attempt.id,
+            orientation: .portrait
+        )
+        let capture = state.registerCapture(
+            attempt: attempt,
+            property: property,
+            room: .kitchen,
+            frameCount: 1,
+            localFile: file
+        )
+        state.endCaptureSequence()
+
+        #expect(capture.hasLocalOriginal)
+        #expect(capture.frameCount == 1)
+        #expect(file.pixelWidth == 400)
+        #expect(file.pixelHeight == 300)
+        #expect(file.byteCount > 0)
+
+        let path = CaptureFileStore.path(for: file)
+        #expect(FileManager.default.fileExists(atPath: path))
+
+        let record = try #require(CaptureFileStore.readRecord(clientCaptureID: attempt.id))
+        #expect(record.captureID == capture.id)
+        #expect(record.clientCaptureID == attempt.id)
+        #expect(record.propertyID == property.id)
+        #expect(record.roomID == RoomType.kitchen.rawValue)
+        #expect(record.fileName == file.fileName)
+        #expect(record.orientation == .portrait)
+
+        // The confirmation the user sees stays the approved one.
+        #expect(capture.status == .preparing)
+
+        try? FileManager.default.removeItem(atPath: path)
+    }
+
+    // A replayed completion of the same shutter action still resolves to one capture and one file.
+    @Test func replayedNativeCompletionKeepsOneCaptureAndOneFile() throws {
+        let state = AppState()
+        state.preparationSeconds = 0.05
+        let property = try #require(state.properties.first)
+        let before = state.captures.count
+
+        let attempt = try #require(state.beginCaptureAttempt(property: property, room: .living))
+        let data = Self.sampleJPEG(width: 320, height: 240)
+        let first = try CaptureFileStore.saveOriginal(
+            photoData: data,
+            clientCaptureID: attempt.id,
+            orientation: .portrait
+        )
+        let replay = try CaptureFileStore.saveOriginal(
+            photoData: data,
+            clientCaptureID: attempt.id,
+            orientation: .portrait
+        )
+        #expect(first.fileName == replay.fileName)
+
+        let capture = state.registerCapture(
+            attempt: attempt, property: property, room: .living, frameCount: 1, localFile: first
+        )
+        let again = state.registerCapture(
+            attempt: attempt, property: property, room: .living, frameCount: 1, localFile: replay
+        )
+        state.endCaptureSequence()
+
+        #expect(capture.id == again.id)
+        #expect(state.captures.count == before + 1)
+
+        try? FileManager.default.removeItem(atPath: CaptureFileStore.path(for: first))
+    }
+
+    // The camera mode is switchable and the stage read-out follows READY → CAPTURING → LOCAL_READY.
+    @Test func captureStageReportsLocalReadyAfterNativeCapture() throws {
+        let state = AppState()
+        state.preparationSeconds = 0.05
+        state.cameraMode = .native
+        #expect(state.captureStageLabel == "READY")
+
+        let property = try #require(state.properties.first)
+        let attempt = try #require(state.beginCaptureAttempt(property: property, room: .living))
+        #expect(state.captureStageLabel == "CAPTURING")
+
+        let file = try CaptureFileStore.saveOriginal(
+            photoData: Self.sampleJPEG(width: 200, height: 150),
+            clientCaptureID: attempt.id,
+            orientation: .landscapeLeft
+        )
+        state.registerCapture(
+            attempt: attempt, property: property, room: .living, frameCount: 1, localFile: file
+        )
+        state.endCaptureSequence()
+
+        #expect(state.captureStageLabel == "LOCAL_READY")
+        #expect(state.cameraDiagnostics.lastFile?.fileName == file.fileName)
+
+        try? FileManager.default.removeItem(atPath: CaptureFileStore.path(for: file))
+    }
+
+    // Normalised error codes never leak an AVFoundation message.
+    @Test func cameraErrorsAreNormalised() {
+        #expect(CameraError.permissionDenied.code == "CAMERA_PERMISSION_DENIED")
+        #expect(CameraError.initializationFailed.code == "CAMERA_INITIALIZATION_FAILED")
+        #expect(CameraError.captureFailed.code == "PHOTO_CAPTURE_FAILED")
+        #expect(CameraError.localSaveFailed.code == "LOCAL_SAVE_FAILED")
+
+        let state = AppState()
+        for error in [
+            CameraError.permissionDenied, .initializationFailed, .captureFailed, .localSaveFailed,
+        ] {
+            let message = state.t(error.localizationKey)
+            #expect(message != error.localizationKey)
+            #expect(!message.contains("AV"))
+        }
+    }
+
+    private static func sampleJPEG(width: Int, height: Int) -> Data {
+        let size = CGSize(width: width, height: height)
+        let image = UIGraphicsImageRenderer(size: size).image { context in
+            UIColor.darkGray.setFill()
+            context.fill(CGRect(origin: .zero, size: size))
+        }
+        return image.jpegData(compressionQuality: 0.9) ?? Data()
+    }
+}
+
 /// Locale coverage: both markets resolve their own terminology from the same components.
 @MainActor
 struct LocalizationTests {
@@ -215,6 +402,23 @@ struct LocalizationTests {
         #expect(state.t("status.preparing") == "Preparando")
         #expect(state.t("capture.done.continue") == "Continuar fotografando")
         #expect(state.t("capture.done.nextRoom") == "Próximo cômodo")
+
+        state.selectRegion(.pt)
+    }
+
+    // The camera permission copy follows each market's own word for the camera.
+    @Test func cameraPermissionCopyIsLocalisedPerMarket() {
+        let state = AppState()
+
+        state.selectRegion(.pt)
+        #expect(state.t("camera.permission.title").contains("câmara"))
+        #expect(state.t("camera.permission.body").contains("câmara"))
+        #expect(state.t("camera.permission.cta") == "Abrir Definições")
+
+        state.selectRegion(.br)
+        #expect(state.t("camera.permission.title").contains("câmera"))
+        #expect(state.t("camera.permission.body").contains("câmera"))
+        #expect(state.t("camera.permission.cta") == "Abrir Ajustes")
 
         state.selectRegion(.pt)
     }

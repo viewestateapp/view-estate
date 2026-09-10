@@ -6,8 +6,8 @@ enum MockData {
     static let villaID = UUID()
     static let loftID = UUID()
 
-    static func properties() -> [Property] {
-        [
+    static func properties(includeDevelopment: Bool = FeatureFlags.developerPanelEnabled) -> [Property] {
+        (includeDevelopment ? [DevFixtures.sergioResidence()] : []) + [
             Property(
                 id: apartmentID,
                 reference: "VE-0231",

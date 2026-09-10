@@ -63,9 +63,7 @@ struct CaptureThumbnail: View {
             Color(VE.elevated)
                 .frame(width: size, height: size)
                 .overlay {
-                    Image(capture.image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
+                    CaptureImage(capture: capture)
                         .allowsHitTesting(false)
                 }
                 .clipShape(.rect(cornerRadius: VE.Radius.tile))

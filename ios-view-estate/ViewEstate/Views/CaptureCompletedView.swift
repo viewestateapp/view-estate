@@ -101,9 +101,7 @@ struct CaptureCompletedView: View {
             Color(VE.elevated)
                 .frame(height: 180)
                 .overlay {
-                    Image(capture.image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fill)
+                    CaptureImage(capture: capture)
                         .allowsHitTesting(false)
                 }
                 .clipped()

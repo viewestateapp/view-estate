@@ -2,7 +2,9 @@ import Foundation
 
 /// Feature flags let the product ship with capabilities disabled for phased rollout.
 enum FeatureFlags {
-    static let cameraNativeEnabled = false
+    /// Default camera implementation at launch. Development can switch at runtime in the
+    /// developer panel, so the simulated viewfinder always stays available as a fallback.
+    static let cameraNativeEnabled = true
     static let hdrProcessingEnabled = false
     static let aiToolsEnabled = true
     static let billingEnabled = false

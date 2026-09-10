@@ -148,6 +148,13 @@ struct Property: Identifiable, Hashable, Sendable {
     var status: PreparationStatus
     var updatedAt: Date
     var isFavorite: Bool
+    /// Production portfolio or a development fixture. Never shown to a normal user.
+    var lifecycle: PropertyLifecycle = .production
+    /// Reference 3D model this property was modelled from, when one exists. A source asset is
+    /// documentation for the space — immutable, and never photographic input.
+    var sourceAsset: PropertySourceAsset?
+
+    var isDevelopmentProperty: Bool { lifecycle.isDevelopment }
 }
 
 // MARK: - Capture
@@ -168,8 +175,13 @@ struct CaptureItem: Identifiable, Hashable, Sendable {
     var assets: [AssetVersion] = []
     /// Captured with no connection and not uploaded yet. Never blocks further photography.
     var isPendingSync: Bool = false
+    /// The real photograph stored in the app container. Present for native camera captures.
+    var localFile: LocalPhotoFile?
 
     var status: PreparationStatus { jobState.userFacing }
+
+    /// A capture whose original bytes already live on this device.
+    var hasLocalOriginal: Bool { localFile != nil }
 
     var originalAsset: AssetVersion? {
         assets.first { $0.type == .original }

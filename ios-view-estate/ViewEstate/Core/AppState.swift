@@ -100,6 +100,22 @@ final class AppState {
     /// Seconds a mock preparation takes before reaching its final state.
     var preparationSeconds: Double = 4
 
+    // MARK: - Camera
+
+    /// Which camera the capture flow uses. Switchable in development so the simulated
+    /// viewfinder always remains a safe fallback (`camera_native_enabled`).
+    var cameraMode: CameraMode = FeatureFlags.cameraNativeEnabled ? .native : .simulated
+    /// Technical camera information for the developer panel only.
+    var cameraDiagnostics = CameraDiagnostics(
+        mode: FeatureFlags.cameraNativeEnabled ? .native : .simulated
+    )
+
+    /// READY → CAPTURING → LOCAL_READY, as reported in the developer panel.
+    var captureStageLabel: String {
+        if captureSessionState == .capturing { return "CAPTURING" }
+        return lastCapture?.hasLocalOriginal == true ? "LOCAL_READY" : "READY"
+    }
+
     var lastCapture: CaptureItem? {
         guard let lastCaptureID else { return nil }
         return captures.first { $0.id == lastCaptureID }
@@ -189,12 +205,18 @@ final class AppState {
     /// same property, same room, same second — always produces a new capture.
     /// The pipeline is never surfaced: the user only ever sees "A preparar" → "Pronta".
     @discardableResult
-    func registerCapture(attempt: CaptureAttempt, property: Property, room: RoomType, frameCount: Int) -> CaptureItem {
+    func registerCapture(
+        attempt: CaptureAttempt,
+        property: Property,
+        room: RoomType,
+        frameCount: Int,
+        localFile: LocalPhotoFile? = nil
+    ) -> CaptureItem {
         if let existing = captures.first(where: { $0.clientCaptureID == attempt.id }) {
             return existing
         }
 
-        let createdAt = Date()
+        let createdAt = localFile?.createdAt ?? Date()
         let item = CaptureItem(
             id: UUID(),
             clientCaptureID: attempt.id,
@@ -206,10 +228,32 @@ final class AppState {
             createdAt: createdAt,
             isFavorite: false,
             assets: [MockData.originalFrames(frameCount: frameCount, createdAt: createdAt)],
-            isPendingSync: !isOnline
+            isPendingSync: !isOnline,
+            localFile: localFile
         )
         captures.insert(item, at: 0)
         lastCaptureID = item.id
+
+        // A real photograph gets a local record so its property and room association survives
+        // on the device, with no connectivity involved.
+        if let localFile {
+            CaptureFileStore.writeRecord(
+                CaptureFileRecord(
+                    captureID: item.id,
+                    clientCaptureID: attempt.id,
+                    propertyID: property.id,
+                    roomID: room.rawValue,
+                    fileName: localFile.fileName,
+                    pixelWidth: localFile.pixelWidth,
+                    pixelHeight: localFile.pixelHeight,
+                    exifOrientation: localFile.exifOrientation,
+                    orientation: localFile.orientation,
+                    byteCount: localFile.byteCount,
+                    createdAt: localFile.createdAt
+                )
+            )
+            cameraDiagnostics.lastFile = localFile
+        }
 
         if let index = properties.firstIndex(where: { $0.id == property.id }) {
             properties[index].photoCount += 1
@@ -401,6 +445,7 @@ final class AppState {
         captureResultMode = .success
         lastCaptureID = nil
         lastAttemptID = nil
+        cameraDiagnostics = CameraDiagnostics(mode: cameraMode)
         isOnline = true
         syncState = .synced
     }

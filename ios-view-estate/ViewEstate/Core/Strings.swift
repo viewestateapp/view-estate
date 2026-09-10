@@ -139,6 +139,12 @@ enum Strings {
         "camera.capturing": "A capturar",
         "camera.prototype": "Pré-visualização",
         "camera.offline": "Sem ligação",
+        "camera.permission.title": "A câmara está desativada.",
+        "camera.permission.body": "Para fotografar imóveis, autorize o acesso à câmara nas Definições do iPhone.",
+        "camera.permission.cta": "Abrir Definições",
+        "camera.error.init": "Não foi possível abrir a câmara. Feche e volte a abrir a câmara.",
+        "camera.error.capture": "Não foi possível tirar a fotografia. Tente novamente.",
+        "camera.error.save": "Não foi possível guardar a fotografia no dispositivo.",
 
         // Capture setup
         "capture.pick.property": "Selecionar imóvel",
@@ -400,6 +406,12 @@ enum Strings {
         "camera.capturing": "Capturando",
         "camera.prototype": "Pré-visualização",
         "camera.offline": "Sem conexão",
+        "camera.permission.title": "A câmera está desativada.",
+        "camera.permission.body": "Para fotografar imóveis, autorize o acesso à câmera nos Ajustes do iPhone.",
+        "camera.permission.cta": "Abrir Ajustes",
+        "camera.error.init": "Não foi possível abrir a câmera. Feche e abra a câmera novamente.",
+        "camera.error.capture": "Não foi possível tirar a foto. Tente novamente.",
+        "camera.error.save": "Não foi possível salvar a foto no dispositivo.",
 
         "capture.pick.property": "Selecionar imóvel",
         "capture.pick.room": "Selecionar cômodo",

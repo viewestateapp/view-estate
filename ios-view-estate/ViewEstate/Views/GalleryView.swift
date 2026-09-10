@@ -123,8 +123,7 @@ struct PhotoDetailView: View {
             ScrollView {
                 if let capture {
                     VStack(alignment: .leading, spacing: VE.Space.m) {
-                        Image(capture.image)
-                            .resizable()
+                        CaptureImage(capture: capture, contentMode: .fit)
                             .aspectRatio(4 / 3, contentMode: .fit)
                             .clipShape(.rect(cornerRadius: VE.Radius.card))
 

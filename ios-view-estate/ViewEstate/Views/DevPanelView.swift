@@ -87,25 +87,90 @@ struct DevPanelView: View {
                 .listRowBackground(VE.surface)
                 .foregroundStyle(VE.textPrimary)
 
+                Section("Camera") {
+                    Picker("Camera Mode", selection: cameraModeBinding) {
+                        ForEach(CameraMode.allCases) { mode in
+                            Text(mode.devLabel).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    flag("camera_native_enabled", state.cameraMode.isNative)
+                    debugRow("Permission", diagnostics.access.devLabel)
+                    if let setup = diagnostics.setup {
+                        debugRow("Device", setup.deviceName)
+                        debugRow("Camera ID", setup.deviceID)
+                        debugRow("Lens", setup.lens)
+                        debugRow("Capture resolution", setup.captureResolution)
+                    } else {
+                        Text("Native session not started in this run.")
+                            .font(.system(size: 13))
+                            .foregroundStyle(VE.textTertiary)
+                    }
+                    if let file = diagnostics.lastFile {
+                        debugRow("Image dimensions", file.pixelDescription)
+                        debugRow("Displayed as", file.displayDescription)
+                        debugRow("Orientation", file.orientation.devLabel)
+                        debugRow("EXIF orientation", "\(file.exifOrientation)")
+                        debugRow("File size", file.sizeDescription)
+                        debugRow("Local file path", CaptureFileStore.path(for: file))
+                    }
+                    if let duration = diagnostics.captureDurationDescription {
+                        debugRow("Capture duration", duration)
+                    }
+                    if let code = diagnostics.lastErrorCode {
+                        debugRow("Last error", code)
+                    }
+                }
+                .listRowBackground(VE.surface)
+
                 Section("Last capture") {
                     if let capture = state.lastCapture, let property = state.property(capture.propertyID) {
                         debugRow("Property", property.title)
                         debugRow("Room", state.roomName(capture.room))
                         debugRow("Capture ID", capture.shortID)
                         debugRow("Client Capture ID", String(capture.clientCaptureID.uuidString.prefix(8)))
-                        debugRow("Capture State", state.captureSessionState.rawValue)
+                        debugRow("Camera Mode", diagnostics.mode.devLabel)
+                        debugRow("Capture State", state.captureStageLabel)
                         debugRow("Processing State", capture.jobState.rawValue)
                         debugRow("User Status", state.t(capture.status.localizationKey))
                         debugRow("Asset State", capture.assets.map(\.type.rawValue).joined(separator: " → "))
+                        debugRow("Local Original", capture.hasLocalOriginal ? "true" : "false")
+                        if let file = capture.localFile {
+                            debugRow("Local file", file.fileName)
+                        }
                         debugRow("Pending Sync", capture.isPendingSync ? "true" : "false")
                     } else {
-                        debugRow("Capture State", state.captureSessionState.rawValue)
+                        debugRow("Capture State", state.captureStageLabel)
                         Text("No capture registered in this session.")
                             .font(.system(size: 13))
                             .foregroundStyle(VE.textTertiary)
                     }
                     debugRow("Preparing queue", "\(state.preparingCount)")
                     debugRow("Pending uploads", "\(state.pendingSyncCount)")
+                }
+                .listRowBackground(VE.surface)
+
+                Section("Development properties") {
+                    if developmentProperties.isEmpty {
+                        Text("No development property registered.")
+                            .font(.system(size: 13))
+                            .foregroundStyle(VE.textTertiary)
+                    }
+                    ForEach(developmentProperties) { property in
+                        debugRow("Property", property.title)
+                        debugRow("Property Type", property.type.rawValue.uppercased())
+                        debugRow("Status", property.lifecycle.devLabel)
+                        if let asset = property.sourceAsset {
+                            debugRow("Source Asset", asset.fileName)
+                            debugRow("Source Type", asset.format.label)
+                            debugRow("source_asset_type", asset.format.rawValue)
+                            debugRow("Original Asset", asset.isImmutable ? "IMMUTABLE" : "MUTABLE")
+                            debugRow("Feeds Camera", asset.canFeedCamera ? "true" : "false")
+                            debugRow("Derivatives", asset.derivativeSummary)
+                        }
+                        debugRow("Captures", "\(state.captures(for: property.id).count)")
+                    }
                 }
                 .listRowBackground(VE.surface)
 
@@ -196,7 +261,7 @@ struct DevPanelView: View {
                 .foregroundStyle(VE.textPrimary)
 
                 Section("Feature flags") {
-                    flag("camera_native_enabled", FeatureFlags.cameraNativeEnabled)
+                    flag("camera_native_enabled", state.cameraMode.isNative)
                     flag("hdr_processing_enabled", FeatureFlags.hdrProcessingEnabled)
                     flag("ai_tools_enabled", FeatureFlags.aiToolsEnabled)
                     flag("billing_enabled", FeatureFlags.billingEnabled)
@@ -228,7 +293,25 @@ struct DevPanelView: View {
         screen = item
     }
 
+    // MARK: - Derived
+
+    private var diagnostics: CameraDiagnostics { state.cameraDiagnostics }
+
+    private var developmentProperties: [Property] {
+        state.properties.filter(\.isDevelopmentProperty)
+    }
+
     // MARK: - Bindings
+
+    private var cameraModeBinding: Binding<CameraMode> {
+        Binding(
+            get: { state.cameraMode },
+            set: { mode in
+                state.cameraMode = mode
+                state.cameraDiagnostics.mode = mode
+            }
+        )
+    }
 
     private var regionBinding: Binding<RegionCode> {
         Binding(get: { state.regionCode }, set: { state.selectRegion($0) })
