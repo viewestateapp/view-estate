@@ -156,6 +156,25 @@ final class CameraService {
         interruptionFlag = true
     }
 
+    /// True only when the session can genuinely accept a capture request right now.
+    ///
+    /// AVFoundation treats a capture request with no active video connection as a programming
+    /// error and raises an exception that cannot be caught, so every request is preflighted:
+    /// a camera taken away by the system becomes a normal, recorded failure instead.
+    private func isReadyForCapture() -> Bool {
+        guard isConfigured, session.isRunning, !interruptionFlag else { return false }
+        guard let connection = photoOutput.connection(with: .video) else { return false }
+        return connection.isActive && connection.isEnabled
+    }
+
+    /// JPEG is requested explicitly only when the active camera actually offers it; otherwise the
+    /// output's own default processed format is used.
+    private func processedFormat() -> [String: Any]? {
+        photoOutput.availablePhotoCodecTypes.contains(.jpeg)
+            ? [AVVideoCodecKey: AVVideoCodecType.jpeg]
+            : nil
+    }
+
     /// Binds the preview layer so rotation stays level with gravity in every orientation.
     func attach(previewLayer: AVCaptureVideoPreviewLayer) {
         self.previewLayer = previewLayer
@@ -202,12 +221,11 @@ final class CameraService {
                 session.addOutput(photoOutput)
 
                 photoOutput.maxPhotoQualityPrioritization = .quality
-                // The base supported dimension is deliberate: it is the resolution bracketed
-                // capture supports, it keeps all nine frames identical, and a nine-frame bracket
-                // at maximum dimensions would be a memory risk for no HDR benefit.
-                if let dimensions = device.activeFormat.supportedMaxPhotoDimensions.first {
-                    photoOutput.maxPhotoDimensions = dimensions
-                }
+                // Photo dimensions are deliberately left at the output's default, which is the
+                // SMALLEST entry of the active format's supported dimensions — exactly the base
+                // geometry a nine-frame bracket needs. Assigning dimensions read before the
+                // preset change is committed can reference a format that is no longer active,
+                // which AVFoundation rejects with a fatal exception.
                 session.commitConfiguration()
                 continuation.resume()
             }
@@ -410,6 +428,10 @@ final class CameraService {
         isCaptureInFlight = true
         defer { isCaptureInFlight = false }
 
+        guard isReadyForCapture() else {
+            throw BracketCaptureFailure(code: .initializationFailed, partial: emptyResult(clientCaptureID))
+        }
+
         let locks = await prepareForSequence()
         var frames: [CaptureFrame] = []
         var persistSeconds: Double = 0
@@ -476,6 +498,9 @@ final class CameraService {
 
         if let failureCode {
             failure = failureCode
+            // The camera's envelope may have changed underneath the attempt, so the next shutter
+            // action plans from a freshly read capability set.
+            readCapabilities()
             VELog.cameraError(
                 failureCode.code,
                 "profile=\(plan.profile.devLabel) frames=\(frames.count)/\(plan.expectedFrameCount)"
@@ -520,37 +545,68 @@ final class CameraService {
         rotationAngle: CGFloat,
         context: SequenceContext
     ) async -> SegmentOutcome {
-        await withCheckedContinuation { continuation in
-            let settings: AVCapturePhotoSettings
-            if context.isBracket, exposures.count >= 1, plan.profile.isBracket {
-                let bracketed = exposures.map {
-                    AVCaptureAutoExposureBracketedStillImageSettings.autoExposureSettings(
-                        exposureTargetBias: Float($0)
-                    )
-                }
-                // Bracketed capture only supports a small set of inherited settings — flash,
-                // stabilisation and quality prioritisation raise exceptions and are left alone.
-                let bracketSettings = AVCapturePhotoBracketSettings(
-                    rawPixelFormatType: 0,
-                    processedFormat: [AVVideoCodecKey: AVVideoCodecType.jpeg],
-                    bracketedSettings: bracketed
-                )
-                bracketSettings.isLensStabilizationEnabled =
-                    photoOutput.isLensStabilizationDuringBracketedCaptureSupported
-                settings = bracketSettings
-            } else {
-                let single = AVCapturePhotoSettings(format: [AVVideoCodecKey: AVVideoCodecType.jpeg])
-                single.flashMode = .off
-                single.photoQualityPrioritization = .quality
-                single.maxPhotoDimensions = photoOutput.maxPhotoDimensions
-                settings = single
-            }
+        guard !exposures.isEmpty else { return SegmentOutcome(failure: .frameMissing) }
+        guard isReadyForCapture() else {
+            return SegmentOutcome(failure: interruptionFlag ? .captureInterrupted : .initializationFailed)
+        }
 
+        let wantsBracket = context.isBracket && plan.profile.isBracket
+        if wantsBracket {
+            // The live limit is re-read for every request: it changes with the session preset and
+            // the active format, and asking for more exposures than the camera supports is a
+            // fatal AVFoundation exception rather than an error callback.
+            guard photoOutput.maxBracketedCapturePhotoCount >= exposures.count else {
+                return SegmentOutcome(failure: .bracketNotSupported)
+            }
+            // Likewise, a bias outside the camera's reported envelope is rejected fatally.
+            if let capabilities {
+                let lower = capabilities.minExposureBias - 0.05
+                let upper = capabilities.maxExposureBias + 0.05
+                let inRange = exposures.allSatisfy { Double($0) >= lower && Double($0) <= upper }
+                guard inRange else { return SegmentOutcome(failure: .exposureRangeUnsupported) }
+            }
+        }
+
+        let settings: AVCapturePhotoSettings
+        if wantsBracket {
+            let bracketed = exposures.map {
+                AVCaptureAutoExposureBracketedStillImageSettings.autoExposureSettings(
+                    exposureTargetBias: Float($0)
+                )
+            }
+            // Bracketed capture only supports a small set of inherited settings — flash,
+            // stabilisation, quality prioritisation and explicit dimensions raise exceptions and
+            // are deliberately left alone.
+            let bracketSettings = AVCapturePhotoBracketSettings(
+                rawPixelFormatType: 0,
+                processedFormat: processedFormat(),
+                bracketedSettings: bracketed
+            )
+            bracketSettings.isLensStabilizationEnabled =
+                photoOutput.isLensStabilizationDuringBracketedCaptureSupported
+            settings = bracketSettings
+        } else {
+            let single = AVCapturePhotoSettings(format: processedFormat())
+            // Every one of these must be something the active camera actually advertises.
+            if photoOutput.supportedFlashModes.contains(.off) {
+                single.flashMode = .off
+            }
+            single.photoQualityPrioritization = photoOutput.maxPhotoQualityPrioritization
+            settings = single
+        }
+
+        // A request that never calls back must not leave the shutter locked forever.
+        let timeout = 6.0 + 3.0 * Double(exposures.count)
+
+        return await withCheckedContinuation { continuation in
+            let gate = CaptureResumeGate()
             let delegate = SequenceCaptureDelegate(
                 requestedEVs: exposures,
                 baseIndex: baseIndex,
                 context: context
             ) { [weak self] outcome in
+                gate.cancelWatchdog()
+                guard gate.claim() else { return }
                 Task { @MainActor [weak self] in
                     self?.captureDelegate = nil
                 }
@@ -558,9 +614,22 @@ final class CameraService {
             }
             captureDelegate = delegate
 
+            gate.watchdog = Task {
+                try? await Task.sleep(for: .seconds(timeout))
+                guard !Task.isCancelled, gate.claim() else { return }
+                continuation.resume(returning: SegmentOutcome(failure: .bracketCaptureFailed))
+            }
+
             sessionQueue.async { [photoOutput] in
-                if let connection = photoOutput.connection(with: .video),
-                   connection.isVideoRotationAngleSupported(rotationAngle) {
+                guard let connection = photoOutput.connection(with: .video),
+                      connection.isActive, connection.isEnabled
+                else {
+                    gate.cancelWatchdog()
+                    guard gate.claim() else { return }
+                    continuation.resume(returning: SegmentOutcome(failure: .captureInterrupted))
+                    return
+                }
+                if connection.isVideoRotationAngleSupported(rotationAngle) {
                     connection.videoRotationAngle = rotationAngle
                 }
                 photoOutput.capturePhoto(with: settings, delegate: delegate)
@@ -579,9 +648,14 @@ final class CameraService {
         guard let device else { return (.unsupported, .unsupported) }
 
         // Zoom is pinned to the physical lens: no digital zoom, and no change between frames.
+        // The factor is clamped into the camera's own range — an out-of-range value is fatal.
         configure(device) { camera in
-            let minimum = camera.minAvailableVideoZoomFactor
-            camera.videoZoomFactor = max(1.0, minimum)
+            let lowest = max(1.0, camera.minAvailableVideoZoomFactor)
+            let target = min(lowest, camera.maxAvailableVideoZoomFactor)
+            guard target >= camera.minAvailableVideoZoomFactor,
+                  abs(camera.videoZoomFactor - target) > 0.001
+            else { return }
+            camera.videoZoomFactor = target
         }
 
         var focus = LockOutcome.unsupported
@@ -675,6 +749,33 @@ private struct SegmentOutcome: Sendable {
     var firstPhotoAt: Date?
     /// Normalised failure. Frames already written are still reported, as evidence.
     var failure: CameraError?
+}
+
+/// Guarantees one capture request resolves exactly once, whether it is the camera or the
+/// watchdog that finishes it.
+private final class CaptureResumeGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isResolved = false
+    private var watchdogTask: Task<Void, Never>?
+
+    var watchdog: Task<Void, Never>? {
+        get { lock.withLock { watchdogTask } }
+        set { lock.withLock { watchdogTask = newValue } }
+    }
+
+    /// Returns true to exactly one caller.
+    func claim() -> Bool {
+        lock.withLock {
+            if isResolved { return false }
+            isResolved = true
+            return true
+        }
+    }
+
+    func cancelWatchdog() {
+        let task = lock.withLock { watchdogTask }
+        task?.cancel()
+    }
 }
 
 /// Bridges AVFoundation's bracketed capture callbacks to `async`/`await`.
