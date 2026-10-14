@@ -17,6 +17,7 @@ struct CameraLabView: View {
 
     var body: some View {
         List {
+            validationSection
             deviceSection
             calibrationSection
             liveStabilitySection
@@ -38,6 +39,52 @@ struct CameraLabView: View {
             reload()
         }
         .onDisappear { stability.stop() }
+    }
+
+    // MARK: - Physical validation (D3-V)
+
+    private var validationSection: some View {
+        Section("Physical validation · D3-V") {
+            if PhysicalValidationStore.isSimulator {
+                note("Simulator: sessions here never count as evidence. Run this on a physical iPhone.")
+            }
+            if let session = state.validationSession {
+                row("Started", session.startedAt.formatted(date: .abbreviated, time: .shortened))
+                row("Device", "\(session.deviceModel) · \(session.systemVersion)")
+                row("Shutter actions", "\(session.runs.count) (\(session.runs.filter(\.succeeded).count) valid)")
+                row("Offline brackets", "\(session.runs.filter { $0.capturedOffline && $0.succeeded }.count)")
+                row("App launches", "\(session.launchCount)")
+                row("Session interruptions / recoveries", "\(session.events.filter { $0.kind == .interrupted || $0.kind == .runtimeError }.count) / \(session.events.filter { $0.kind == .recovered }.count)")
+                row("Duplicate clientCaptureID", "\(session.duplicateClientCaptureIDs)")
+                row("Credits before / now", "\(session.creditsBefore) / \(state.wallet.total)")
+                row("Manual checks", "\(ManualValidationCheck.allCases.filter { session.verdict($0) != .pending }.count)/\(ManualValidationCheck.allCases.count) recorded")
+                row("Decision", session.decision.rawValue)
+                NavigationLink {
+                    PhysicalValidationChecklistView()
+                } label: {
+                    link("Human checks, ultra-wide & profile")
+                }
+                NavigationLink {
+                    CameraCalibrationReportView()
+                } label: {
+                    link("Final camera calibration report")
+                }
+                Button(role: .destructive) {
+                    state.discardValidationSession()
+                } label: {
+                    Text("Discard validation session")
+                        .font(.system(size: 14, weight: .medium))
+                }
+            } else {
+                note("Start a session before the first test capture. It records every shutter action, camera interruption and the credit balance, and survives app restarts. Only captures after the start count as evidence.")
+                Button {
+                    state.startValidationSession()
+                } label: {
+                    link("Start validation session")
+                }
+            }
+        }
+        .listRowBackground(VE.surface)
     }
 
     // MARK: - Device & camera
@@ -248,11 +295,6 @@ struct CameraLabView: View {
 
     private var datasetSection: some View {
         Section("Dataset & report") {
-            NavigationLink {
-                CameraCalibrationReportView(manifests: manifests)
-            } label: {
-                link("Final camera calibration report")
-            }
             Button {
                 Task { await exportDataset() }
             } label: {
@@ -417,48 +459,3 @@ private struct ScoreBar: View {
     }
 }
 
-/// The automatic draft of the Final Camera Calibration Report, shareable as text.
-struct CameraCalibrationReportView: View {
-    let manifests: [CaptureManifest]
-
-    @Environment(AppState.self) private var state
-    @State private var report: String?
-
-    var body: some View {
-        ScrollView {
-            if let report {
-                Text(report)
-                    .font(.system(size: 12, design: .monospaced))
-                    .foregroundStyle(VE.textPrimary)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(VE.Space.m)
-            } else {
-                ProgressView("Analysing frames…")
-                    .tint(VE.copper)
-                    .padding(.top, 80)
-            }
-        }
-        .background(VE.canvas)
-        .navigationTitle("Calibration report")
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            if let report {
-                ToolbarItem(placement: .topBarTrailing) {
-                    ShareLink(item: report)
-                }
-            }
-        }
-        .preferredColorScheme(.dark)
-        .task {
-            let input = CameraCalibrationReportBuilder.Input(
-                diagnostics: state.cameraDiagnostics,
-                manifests: manifests,
-                appVersion: CaptureManifestBuilder.appVersion
-            )
-            report = await Task.detached(priority: .utility) {
-                CameraCalibrationReportBuilder.build(input)
-            }.value
-        }
-    }
-}

@@ -587,7 +587,7 @@ struct CameraPrototypeView: View {
         } catch {
             let context = recordingContext(motion: stability.endCaptureWindow())
             guard let failure = error as? BracketCaptureFailure else {
-                report((error as? CameraError) ?? .bracketCaptureFailed, attempt: attempt, manifest: nil)
+                report((error as? CameraError) ?? .bracketCaptureFailed, attempt: attempt, manifest: nil, result: nil)
                 return
             }
             // Whatever reached the device is kept as an incomplete attempt — never as a capture.
@@ -598,11 +598,12 @@ struct CameraPrototypeView: View {
                 organizationID: state.organizationName,
                 context: context
             )
-            report(failure.code, attempt: attempt, manifest: manifest)
+            report(failure.code, attempt: attempt, manifest: manifest, result: failure.partial)
             return
         }
 
         let context = recordingContext(motion: stability.endCaptureWindow())
+        let finalizeStartedAt = Date()
         do {
             state.beginLocalValidation()
             let manifest = try CaptureManifestBuilder.finalize(
@@ -616,7 +617,13 @@ struct CameraPrototypeView: View {
             state.cameraDiagnostics.lastManifest = manifest
             state.cameraDiagnostics.lastErrorCode = nil
             syncDiagnostics()
-            recordRun(attempt: attempt, manifest: manifest, failure: nil)
+            recordRun(
+                attempt: attempt,
+                manifest: manifest,
+                failure: nil,
+                result: result,
+                finalizeMs: Date().timeIntervalSince(finalizeStartedAt) * 1000
+            )
             finishCapturing()
             onCaptured(
                 attempt,
@@ -628,7 +635,7 @@ struct CameraPrototypeView: View {
             )
         } catch {
             let code = (error as? CameraError) ?? .bracketCaptureFailed
-            report(code, attempt: attempt, manifest: CaptureBundleStore.readManifest(clientCaptureID: attempt.id))
+            report(code, attempt: attempt, manifest: CaptureBundleStore.readManifest(clientCaptureID: attempt.id), result: result)
         }
     }
 
@@ -636,16 +643,24 @@ struct CameraPrototypeView: View {
         CaptureRecordingContext(motion: motion, capturedOffline: !state.isOnline, qaTag: state.qaTag)
     }
 
-    private func report(_ code: CameraError, attempt: CaptureAttempt, manifest: CaptureManifest?) {
+    private func report(_ code: CameraError, attempt: CaptureAttempt, manifest: CaptureManifest?, result: BracketCaptureResult?) {
         state.cameraDiagnostics.lastErrorCode = code.code
         state.cameraDiagnostics.lastManifest = manifest
         syncDiagnostics()
-        recordRun(attempt: attempt, manifest: manifest, failure: code)
+        recordRun(attempt: attempt, manifest: manifest, failure: code, result: result, finalizeMs: nil)
         errorMessage = state.t(code.localizationKey)
         finishCapturing()
     }
 
-    private func recordRun(attempt: CaptureAttempt, manifest: CaptureManifest?, failure: CameraError?) {
+    private func recordRun(
+        attempt: CaptureAttempt,
+        manifest: CaptureManifest?,
+        failure: CameraError?,
+        result: BracketCaptureResult?,
+        finalizeMs: Double?
+    ) {
+        let memory = DeviceHealthProbe.memoryFootprintMB()
+        let thermal = DeviceHealthProbe.thermalStateLabel()
         state.recordCaptureRun(
             CaptureRunMetric(
                 clientCaptureID: attempt.id,
@@ -654,10 +669,33 @@ struct CameraPrototypeView: View {
                 frameCount: manifest?.actualFrameCount ?? 0,
                 bracketDurationMs: manifest?.quality?.bracketDurationMs,
                 tapToCaptureStartMs: manifest?.quality?.tapToCaptureStartMs,
-                memoryFootprintMB: DeviceHealthProbe.memoryFootprintMB(),
-                thermalState: DeviceHealthProbe.thermalStateLabel(),
+                memoryFootprintMB: memory,
+                thermalState: thermal,
                 qualityClass: manifest?.quality?.qualityClass,
                 failureCode: failure?.code
+            )
+        )
+        // Physical validation evidence — only while a session is open in the Camera Lab.
+        state.recordValidationRun(
+            ValidationRun(
+                clientCaptureID: attempt.id,
+                at: .now,
+                launchID: PhysicalValidationStore.currentLaunchID,
+                succeeded: failure == nil,
+                failureCode: failure?.code,
+                profile: manifest?.captureProfile.devLabel ?? result?.plan.profile.devLabel,
+                lens: manifest?.lensType ?? result?.lensType,
+                frameCount: manifest?.actualFrameCount ?? 0,
+                totalBytes: manifest?.totalByteCount ?? 0,
+                capturedOffline: !state.isOnline,
+                tapToCaptureStartMs: result?.tapToCaptureStartMs,
+                tapToFirstFrameMs: result?.tapToFirstFrameMs,
+                bracketDurationMs: result?.bracketDurationMs,
+                framePersistMs: result.map { $0.persistSeconds * 1000 },
+                finalizeMs: finalizeMs,
+                memoryFootprintMB: memory,
+                thermalState: thermal,
+                qualityClass: manifest?.quality?.qualityClass
             )
         )
     }
@@ -665,6 +703,7 @@ struct CameraPrototypeView: View {
     /// Starts the real camera with the calibration-preferred lens (or the developer lens test)
     /// and hands the resolved calibration to the stability analysis.
     private func startCamera() async {
+        camera.onSessionEvent = { [state] kind in state.recordCameraSessionEvent(kind) }
         await camera.start(lensOverride: state.devLensOverride)
         stability.apply(camera.calibration)
         syncDiagnostics()

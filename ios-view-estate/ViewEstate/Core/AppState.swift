@@ -136,6 +136,63 @@ final class AppState {
         }
     }
 
+    // MARK: - Physical validation (Phase D3-V, development only)
+
+    /// Evidence collected on a physical iPhone. Persisted so restart tests keep their evidence.
+    private(set) var validationSession: PhysicalValidationSession?
+
+    /// Opens a validation session and freezes the credit balance it must end with.
+    func startValidationSession() {
+        let capabilities = cameraDiagnostics.capabilities
+        var session = PhysicalValidationSession(
+            startedAt: .now,
+            deviceModel: capabilities?.deviceModel ?? CameraService.deviceModelName(),
+            systemVersion: capabilities?.systemVersion ?? "iOS " + UIDevice.current.systemVersion,
+            appVersion: CaptureManifestBuilder.appVersion,
+            isSimulator: PhysicalValidationStore.isSimulator,
+            creditsBefore: wallet.total,
+            creditTransactionsBefore: transactions.count
+        )
+        session.events.append(
+            CameraSessionEvent(kind: .appLaunched, at: .now, launchID: PhysicalValidationStore.currentLaunchID)
+        )
+        validationSession = session
+        PhysicalValidationStore.save(session)
+    }
+
+    func discardValidationSession() {
+        validationSession = nil
+        PhysicalValidationStore.save(nil)
+    }
+
+    /// Every validation mutation goes through here so it is persisted immediately.
+    func updateValidation(_ change: (inout PhysicalValidationSession) -> Void) {
+        guard var session = validationSession else { return }
+        change(&session)
+        if session.runs.count > PhysicalValidationSession.maxRuns {
+            session.runs.removeFirst(session.runs.count - PhysicalValidationSession.maxRuns)
+        }
+        if session.events.count > PhysicalValidationSession.maxEvents {
+            session.events.removeFirst(session.events.count - PhysicalValidationSession.maxEvents)
+        }
+        validationSession = session
+        PhysicalValidationStore.save(session)
+    }
+
+    func recordValidationRun(_ run: ValidationRun) {
+        updateValidation { $0.runs.append(run) }
+    }
+
+    func recordCameraSessionEvent(_ kind: CameraSessionEventKind) {
+        updateValidation {
+            $0.events.append(CameraSessionEvent(kind: kind, at: .now, launchID: PhysicalValidationStore.currentLaunchID))
+        }
+    }
+
+    func setManualCheck(_ check: ManualValidationCheck, _ verdict: ValidationVerdict) {
+        updateValidation { $0.manualChecks[check.rawValue] = verdict }
+    }
+
     /// READY → CAPTURING → LOCAL_VALIDATING → LOCAL_READY, as reported in the developer panel.
     var captureStageLabel: String {
         if captureSessionState == .capturing {
@@ -187,6 +244,12 @@ final class AppState {
 
         // A capture whose frames and manifest were safely persisted survives a relaunch.
         restorePendingCaptures()
+
+        // An open physical validation keeps collecting across relaunches.
+        if let session = PhysicalValidationStore.load() {
+            validationSession = session
+            recordCameraSessionEvent(.appLaunched)
+        }
     }
 
     // MARK: - Localisation

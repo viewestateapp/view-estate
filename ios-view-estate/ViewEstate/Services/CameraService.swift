@@ -26,6 +26,8 @@ struct BracketCaptureResult: Sendable {
     var tapToCaptureStartMs: Double?
     /// First capture request → last frame delivered, ms.
     var bracketDurationMs: Double?
+    /// Shutter tap → first frame delivered, ms.
+    var tapToFirstFrameMs: Double? = nil
 
     var focusLock: LockOutcome { preparation.focusLock }
     var whiteBalanceLock: LockOutcome { preparation.whiteBalanceLock }
@@ -93,6 +95,8 @@ final class CameraService {
     private var isCaptureInFlight = false
     /// The camera screen wants the session live; drives recovery after interruptions.
     private var wantsRunning = false
+    /// Development hook: session lifecycle events for the physical validation log.
+    @ObservationIgnored var onSessionEvent: ((CameraSessionEventKind) -> Void)?
 
     // MARK: - Permission
 
@@ -436,6 +440,7 @@ final class CameraService {
                     guard let self else { return }
                     self.markInterrupted()
                     self.isRunning = false
+                    self.onSessionEvent?(.interrupted)
                     VELog.camera("session interrupted duringCapture=\(self.isCaptureInFlight)")
                 }
             }
@@ -445,6 +450,7 @@ final class CameraService {
             center.addObserver(forName: AVCaptureSession.interruptionEndedNotification, object: session, queue: .main) { [weak self] _ in
                 Task { @MainActor [weak self] in
                     VELog.camera("session interruption ended")
+                    self?.onSessionEvent?(.interruptionEnded)
                     self?.recoverSession()
                 }
             }
@@ -458,6 +464,7 @@ final class CameraService {
                     guard let self else { return }
                     self.markInterrupted()
                     self.isRunning = false
+                    self.onSessionEvent?(.runtimeError)
                     VELog.camera("session runtime error mediaServicesReset=\(mediaServicesReset)")
                     // Media services reset (or a transient error) is recoverable by restarting.
                     self.recoverSession()
@@ -487,6 +494,7 @@ final class CameraService {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.isRunning = running
+                self.onSessionEvent?(running ? .recovered : .recoveryFailed)
                 if running {
                     self.applyRotationAngles()
                     self.readCapabilities()
@@ -686,7 +694,8 @@ final class CameraService {
             tapToCaptureStartMs: firstRequestAt.map { $0.timeIntervalSince(tapAt) * 1000 },
             bracketDurationMs: firstRequestAt.flatMap { start in
                 (lastFrameAt ?? completedAt).timeIntervalSince(start) * 1000
-            }
+            },
+            tapToFirstFrameMs: firstPhotoAt.map { $0.timeIntervalSince(tapAt) * 1000 }
         )
 
         if interruptionFlag { failureCode = .captureInterrupted }
