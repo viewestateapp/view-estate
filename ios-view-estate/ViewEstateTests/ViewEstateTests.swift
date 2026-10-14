@@ -484,7 +484,8 @@ struct MultiExposureBracketTests {
             (3.5, .standard7),
             (2.5, .compact5),
             (2.0, .compact5),
-            (1.5, .basic3),
+            // BASIC_3 is −2/0/+2: a ±1.5 EV camera cannot reach it and photographs one frame.
+            (1.5, .single),
         ]
         for (range, expected) in expectations {
             let capabilities = Self.capabilities(min: -range, max: range, bracket: 9)
@@ -547,7 +548,7 @@ struct MultiExposureBracketTests {
 
         #expect(frames.count == 9)
         #expect(frames.map(\.sequenceIndex) == Array(0..<9))
-        #expect(frames.map { Int($0.requestedEV) } == CaptureProfile.full9.exposureValues)
+        #expect(frames.map(\.requestedEV) == CaptureProfile.full9.exposureValues)
         #expect(frames.filter(\.isReferenceExposure).count == 1)
         #expect(Set(frames.map(\.checksum)).count == 9)
         #expect(frames.allSatisfy { $0.clientCaptureID == attempt.id })
@@ -666,7 +667,7 @@ struct MultiExposureBracketTests {
             frames: frames.shuffled(), attempt: attempt, property: property, profile: .compact5
         )
         #expect(shuffled.orderedFrames.map(\.sequenceIndex) == Array(0..<5))
-        #expect(shuffled.orderedFrames.map { Int($0.requestedEV) } == CaptureProfile.compact5.exposureValues)
+        #expect(shuffled.orderedFrames.map(\.requestedEV) == CaptureProfile.compact5.exposureValues)
         #expect(CaptureBundleValidator.validate(shuffled) == nil)
 
         var duplicated = frames
@@ -853,17 +854,17 @@ struct MultiExposureBracketTests {
         clientCaptureID: UUID
     ) throws -> [CaptureFrame] {
         try profile.exposureValues.enumerated().map { index, ev in
-            let brightness = 0.5 + Double(ev) * 0.1
+            let brightness = 0.5 + ev * 0.1
             var frame = try CaptureBundleStore.writeFrame(
                 photoData: jpeg(brightness: brightness),
                 clientCaptureID: clientCaptureID,
                 sequenceIndex: index,
-                requestedEV: Double(ev),
+                requestedEV: ev,
                 orientation: .portrait,
                 cameraID: "test-camera",
                 lensType: "Rear Wide"
             )
-            frame.actualExposureBias = Double(ev)
+            frame.actualExposureBias = ev
             frame.iso = 100 * Double(index + 1)
             frame.exposureDurationSeconds = 1.0 / Double(120 - index * 10)
             frame.aperture = 1.78
@@ -907,6 +908,679 @@ struct MultiExposureBracketTests {
     }
 
     /// A 4:3 image, dark for negative exposures and bright for positive ones.
+    private static func jpeg(brightness: Double) -> Data {
+        let size = CGSize(width: 400, height: 300)
+        let level = Swift.max(0.02, Swift.min(0.98, brightness))
+        let image = UIGraphicsImageRenderer(size: size).image { context in
+            UIColor(white: level, alpha: 1).setFill()
+            context.fill(CGRect(origin: .zero, size: size))
+        }
+        return image.jpegData(compressionQuality: 0.9) ?? Data()
+    }
+}
+
+/// Phase D3: stability, focus, exposure and physical camera calibration.
+///
+/// These tests lock the deterministic parts — rolling-window stability, level math, calibration
+/// resolution and sanitising, fractional ladders, quality grading, storage preflight, histogram
+/// analysis and zero credit movement. Real sensor behaviour, real focus and real white balance
+/// can only be judged on a physical iPhone with the standard test scenes.
+@MainActor
+@Suite(.serialized)
+struct CameraCalibrationTests {
+
+    // MARK: - Stability
+
+    // One calm reading is not enough: the window must stay calm for the minimum duration.
+    @Test func stabilityNeedsACalmWindowBeforeReportingStable() {
+        var analyzer = StabilityAnalyzer(thresholds: .default, levelToleranceDegrees: 1.5)
+        var reading = StabilityReading.idle
+        var time = 0.0
+        while time < 0.3 {
+            reading = analyzer.ingest(Self.sample(time))
+            time += 1.0 / 30.0
+        }
+        #expect(reading.state == .stabilizing)
+        while time < 0.6 {
+            reading = analyzer.ingest(Self.sample(time))
+            time += 1.0 / 30.0
+        }
+        #expect(reading.state == .stable)
+        #expect(reading.score > 0.99)
+        #expect(!reading.isSevere)
+    }
+
+    // Movement makes it unstable at once; a hard jolt is severe and may hold the shutter.
+    @Test func movementIsUnstableAndAJoltIsSevere() {
+        var analyzer = StabilityAnalyzer(thresholds: .default, levelToleranceDegrees: 1.5)
+        var time = 0.0
+        for _ in 0..<20 {
+            _ = analyzer.ingest(Self.sample(time))
+            time += 1.0 / 30.0
+        }
+        let moving = analyzer.ingest(Self.sample(time, rotation: 0.5))
+        #expect(moving.state == .unstable)
+        #expect(!moving.isSevere)
+        #expect(moving.score < 0.5)
+
+        time += 1.0 / 30.0
+        let jolt = analyzer.ingest(Self.sample(time, rotation: 2.0))
+        #expect(jolt.isSevere)
+        #expect(jolt.state == .unstable)
+        #expect(StabilityThresholds.default.blockCaptureWhenSevere)
+    }
+
+    @Test func stabilityScoreIsNormalised() {
+        #expect(StabilityAnalyzer.score(ratio: 0) == 1)
+        #expect(StabilityAnalyzer.score(ratio: 1) == 0.5)
+        #expect(StabilityAnalyzer.score(ratio: 2) == 0)
+        #expect(StabilityAnalyzer.score(ratio: 40) == 0)
+        #expect(StabilityAnalyzer.score(ratio: .nan) == 0)
+    }
+
+    // Roll is measured against the nearest upright or landscape orientation; pitch is camera tilt.
+    @Test func levelIsCorrectInPortraitAndLandscape() {
+        let upright = StabilityAnalyzer.level(gravityX: 0, gravityY: -1, gravityZ: 0)
+        #expect(abs(upright.roll) < 0.001)
+        #expect(abs(upright.pitch) < 0.001)
+
+        let radians = 3.0 * .pi / 180
+        let tilted = StabilityAnalyzer.level(gravityX: sin(radians), gravityY: -cos(radians), gravityZ: 0)
+        #expect(abs(tilted.roll - 3) < 0.01)
+
+        let landscape = StabilityAnalyzer.level(gravityX: -cos(radians), gravityY: -sin(radians), gravityZ: 0)
+        #expect(abs(landscape.horizon + 87) < 0.01)
+        #expect(abs(landscape.roll - 3) < 0.01)
+
+        let pitchRadians = 10.0 * .pi / 180
+        let pitched = StabilityAnalyzer.level(gravityX: 0, gravityY: -cos(pitchRadians), gravityZ: -sin(pitchRadians))
+        #expect(abs(pitched.pitch - 10) < 0.01)
+
+        var analyzer = StabilityAnalyzer(thresholds: .default, levelToleranceDegrees: 1.5)
+        let level = analyzer.ingest(Self.sample(0, gravity: (sin(radians), -cos(radians), 0)))
+        #expect(!level.isLevel)
+    }
+
+    // Motion during a bracket is flagged — the frames are kept for the future HDR engine.
+    @Test func bracketMotionIsAssessedNotDeleted() {
+        var analyzer = StabilityAnalyzer(thresholds: .default, levelToleranceDegrees: 1.5)
+        var time = 0.0
+        var reading = StabilityReading.idle
+        for _ in 0..<20 {
+            reading = analyzer.ingest(Self.sample(time))
+            time += 1.0 / 30.0
+        }
+
+        var calm = CaptureMotionRecorder(before: reading)
+        for _ in 0..<10 {
+            let sample = Self.sample(time)
+            calm.record(sample: sample, reading: analyzer.ingest(sample))
+            time += 1.0 / 30.0
+        }
+        let calmSnapshot = calm.snapshot(sensorAvailable: true, thresholds: .default)
+        #expect(calmSnapshot.assessment == .none)
+        #expect(calmSnapshot.rollAngleAtCapture != nil)
+        #expect((calmSnapshot.stabilityScore ?? 0) > 0.9)
+
+        var shaken = CaptureMotionRecorder(before: reading)
+        let jolt = Self.sample(time, rotation: 2.5)
+        shaken.record(sample: jolt, reading: analyzer.ingest(jolt))
+        let shakenSnapshot = shaken.snapshot(sensorAvailable: true, thresholds: .default)
+        #expect(shakenSnapshot.assessment == .severe)
+        #expect((shakenSnapshot.maxRotationDuringCapture ?? 0) >= 2.5)
+
+        #expect(calm.snapshot(sensorAvailable: false, thresholds: .default).assessment == .unavailable)
+    }
+
+    // MARK: - Calibration
+
+    @Test func calibrationResolvesTheMostSpecificProfile() {
+        var family = CameraCalibrationProfile.generic
+        family.id = "iphone16-family"
+        family.deviceModel = "iPhone16,"
+        var exact = CameraCalibrationProfile.generic
+        exact.id = "iphone16-1"
+        exact.deviceModel = "iPhone16,1"
+        exact.status = .testing
+        var pinned = exact
+        pinned.id = "iphone16-1-cam"
+        pinned.cameraUniqueID = "camera-A"
+        var future = CameraCalibrationProfile.generic
+        future.id = "future-os"
+        future.deviceModel = "iPhone16,1"
+        future.osVersionRange = OSVersionRange(minimum: "30.0", maximum: nil)
+        let profiles = [CameraCalibrationProfile.generic, family, exact, pinned, future]
+
+        #expect(CameraCalibrationCatalog.resolve(deviceModel: "iPhone15,2", systemVersion: "18.2", profiles: profiles).id == "generic")
+        #expect(CameraCalibrationCatalog.resolve(deviceModel: "iPhone16,2", systemVersion: "18.2", profiles: profiles).id == "iphone16-family")
+        #expect(CameraCalibrationCatalog.resolve(deviceModel: "iPhone16,1", systemVersion: "18.2", profiles: profiles).id == "iphone16-1")
+        #expect(CameraCalibrationCatalog.resolve(deviceModel: "iPhone16,1", systemVersion: "26.0", cameraUniqueID: "camera-A", profiles: profiles).id == "iphone16-1-cam")
+        // Nothing ships as CALIBRATED before physical QA.
+        #expect(CameraCalibrationCatalog.bundled.allSatisfy { $0.status != .calibrated })
+    }
+
+    // Remote calibration is configuration only — every value is clamped, bad ladders dropped.
+    @Test func remoteCalibrationIsSanitised() throws {
+        var hostile = CameraCalibrationProfile.generic
+        hostile.id = "remote"
+        hostile.exposureValues = [-3, -1, 1, 3]
+        hostile.levelToleranceDegrees = 90
+        hostile.focusStrategy.settleTimeoutMs = 60_000
+        hostile.stabilityThresholds.stabilityWindowMs = -5
+        hostile.profileVersion = 0
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(CalibrationPayload(schemaVersion: 1, issuedAt: .now, profiles: [hostile]))
+        let safe = try #require(try CameraCalibrationCatalog.decode(data).first)
+        #expect(safe.exposureValues == nil)
+        #expect(safe.levelToleranceDegrees == 10)
+        #expect(safe.focusStrategy.settleTimeoutMs == 2500)
+        #expect(safe.stabilityThresholds.stabilityWindowMs == 150)
+        #expect(safe.profileVersion == 1)
+
+        let unsupported = try encoder.encode(CalibrationPayload(schemaVersion: 99, issuedAt: .now, profiles: [hostile]))
+        #expect(throws: CalibrationPayloadError.self) { try CameraCalibrationCatalog.decode(unsupported) }
+
+        #expect(CameraCalibrationCatalog.sanitizeLadder([0.5, -0.5, 0]) == [-0.5, 0, 0.5])
+        #expect(CameraCalibrationCatalog.sanitizeLadder([-9, 0, 9]) == nil)
+        #expect(CameraCalibrationCatalog.sanitizeLadder([-1, 0, 0, 1]) == nil)
+    }
+
+    // A device-specific fractional ladder is used when the hardware reaches every value.
+    @Test func fractionalDeviceLadderIsUsedWhenSupported() {
+        var calibration = CameraCalibrationProfile.generic
+        calibration.exposureValues = [-2.5, -1.5, -0.5, 0, 0.5, 1.5, 2.5]
+
+        let plan = CaptureProfileService.plan(for: Self.capabilities(range: 8, bracket: 9), calibration: calibration)
+        #expect(plan.exposureValues == [-2.5, -1.5, -0.5, 0, 0.5, 1.5, 2.5])
+        #expect(plan.ladderSource == .deviceCalibration)
+        #expect(plan.profile == .standard7)
+        #expect(plan.calibrationVersion == calibration.versionLabel)
+
+        let segmented = CaptureProfileService.plan(for: Self.capabilities(range: 8, bracket: 3), calibration: calibration)
+        #expect(segmented.isSegmented)
+        #expect(segmented.segments.allSatisfy { $0.count <= 3 })
+        #expect(segmented.exposureValues == plan.exposureValues)
+
+        // A ladder the camera cannot reach falls back to the standard profiles.
+        let narrow = CaptureProfileService.plan(for: Self.capabilities(range: 2, bracket: 9), calibration: calibration)
+        #expect(narrow.ladderSource == .standardProfile)
+        #expect(narrow.profile == .compact5)
+    }
+
+    @Test func calibrationCanCapOrDisableBracketing() {
+        var capped = CameraCalibrationProfile.generic
+        capped.captureProfile = .compact5
+        #expect(CaptureProfileService.plan(for: Self.capabilities(range: 8, bracket: 9), calibration: capped).profile == .compact5)
+
+        var disabled = CameraCalibrationProfile.generic
+        disabled.status = .disabled
+        #expect(CaptureProfileService.plan(for: Self.capabilities(range: 8, bracket: 9), calibration: disabled).profile == .single)
+    }
+
+    @Test func evLabelsKeepSignAndFractions() {
+        #expect(CaptureProfile.evLabel(-4) == "-4")
+        #expect(CaptureProfile.evLabel(0) == "0")
+        #expect(CaptureProfile.evLabel(2) == "+2")
+        #expect(CaptureProfile.evLabel(-0.5) == "-0.5")
+        #expect(CaptureProfile.evLabel(2.5) == "+2.5")
+        #expect(CaptureProfile.evLabel(0.25) == "+0.25")
+    }
+
+    // A fractional ladder persists, validates and keeps distinct file names.
+    @Test func fractionalBracketBundleValidates() throws {
+        let state = AppState()
+        let property = try #require(state.properties.first)
+        let attempt = try #require(state.beginCaptureAttempt(property: property, room: .living))
+        defer {
+            state.endCaptureSequence()
+            CaptureBundleStore.delete(clientCaptureID: attempt.id)
+        }
+
+        let ladder: [Double] = [-1.5, 0, 1.5]
+        let frames = try ladder.enumerated().map { index, ev in
+            try CaptureBundleStore.writeFrame(
+                photoData: Self.jpeg(brightness: 0.5 + ev * 0.1),
+                clientCaptureID: attempt.id,
+                sequenceIndex: index,
+                requestedEV: ev,
+                orientation: .landscapeLeft,
+                cameraID: "test-camera",
+                lensType: "Rear Wide"
+            )
+        }
+        #expect(Set(frames.map(\.fileName)).count == 3)
+        #expect(frames[0].fileName.contains("-1.5"))
+        #expect(frames[2].fileName.contains("+1.5"))
+
+        var manifest = Self.manifest(frames: frames, attempt: attempt, property: property, profile: .basic3)
+        manifest.requestedExposureValues = ladder
+        manifest.orientation = .landscapeLeft
+        #expect(CaptureBundleValidator.validate(manifest) == nil)
+
+        // The standard BASIC_3 ladder (-2/0/+2) would not match these frames.
+        manifest.requestedExposureValues = nil
+        #expect(CaptureBundleValidator.validate(manifest) == .manifestInvalid)
+    }
+
+    // A bundle written before D3 (schema v1, no quality report) is still a valid capture.
+    @Test func schemaV1BundlesRemainValid() throws {
+        let state = AppState()
+        let property = try #require(state.properties.first)
+        let attempt = try #require(state.beginCaptureAttempt(property: property, room: .kitchen))
+        defer {
+            state.endCaptureSequence()
+            CaptureBundleStore.delete(clientCaptureID: attempt.id)
+        }
+
+        let frames = try CaptureProfile.basic3.exposureValues.enumerated().map { index, ev in
+            try CaptureBundleStore.writeFrame(
+                photoData: Self.jpeg(brightness: 0.5 + ev * 0.1),
+                clientCaptureID: attempt.id,
+                sequenceIndex: index,
+                requestedEV: ev,
+                orientation: .portrait,
+                cameraID: "test-camera",
+                lensType: "Rear Wide"
+            )
+        }
+        var manifest = Self.manifest(frames: frames, attempt: attempt, property: property, profile: .basic3)
+        manifest.schemaVersion = 1
+        try CaptureBundleStore.writeManifest(manifest)
+
+        let reloaded = try #require(CaptureBundleStore.readManifest(clientCaptureID: attempt.id))
+        #expect(reloaded.quality == nil)
+        #expect(reloaded.requestedLadder == [-2, 0, 2])
+        #expect(CaptureBundleValidator.validate(reloaded) == nil)
+    }
+
+    // MARK: - Quality
+
+    @Test func qualityClassFollowsLocksMotionAndConsistency() {
+        let id = UUID()
+        let wb = WhiteBalanceReading(redGain: 1.9, greenGain: 1.0, blueGain: 2.1, temperature: 5200, tint: 2)
+        let steady = (0..<3).map { Self.frame(index: $0, lens: 0.42, wb: wb, clientCaptureID: id) }
+
+        let good = CaptureQualityAnalyzer.report(Self.qualityInput(frames: steady))
+        #expect(good.qualityClass == .good)
+        #expect(good.qualityReasons.isEmpty)
+        #expect(good.focusLockSucceeded && good.whiteBalanceLockSucceeded && good.exposureReferenceEstablished)
+
+        var shifted = steady
+        shifted[2].lensPosition = 0.55
+        let focusShift = CaptureQualityAnalyzer.report(Self.qualityInput(frames: shifted))
+        #expect(focusShift.focusShiftDetected)
+        #expect(focusShift.qualityClass == .poor)
+
+        var tinted = steady
+        tinted[1].whiteBalance = WhiteBalanceReading(redGain: 1.5, greenGain: 1.0, blueGain: 2.4, temperature: 4300, tint: 2)
+        let colour = CaptureQualityAnalyzer.report(Self.qualityInput(frames: tinted))
+        #expect(colour.whiteBalanceVariation)
+        #expect(colour.qualityClass == .poor)
+        #expect(colour.qualityReasons.contains("WHITE_BALANCE_VARIATION"))
+
+        var minorMotion = Self.stableMotion
+        minorMotion.assessment = .warning
+        #expect(CaptureQualityAnalyzer.report(Self.qualityInput(frames: steady, motion: minorMotion)).qualityClass == .warning)
+
+        var severe = Self.stableMotion
+        severe.assessment = .severe
+        #expect(CaptureQualityAnalyzer.report(Self.qualityInput(frames: steady, motion: severe)).qualityClass == .poor)
+
+        var timeout = Self.goodPreparation
+        timeout.focusTimeout = true
+        let timedOut = CaptureQualityAnalyzer.report(Self.qualityInput(frames: steady, preparation: timeout))
+        #expect(timedOut.qualityClass == .warning)
+        #expect(timedOut.qualityReasons.contains("FOCUS_TIMEOUT"))
+
+        #expect(CaptureQualityAnalyzer.report(Self.qualityInput(frames: steady, motion: .unavailable)).qualityClass == .warning)
+    }
+
+    @Test func frameIntervalsComeFromSensorTimestamps() throws {
+        let id = UUID()
+        var frames = (0..<3).map { Self.frame(index: $0, lens: 0.4, wb: nil, clientCaptureID: id) }
+        frames[0].sensorTimestampSeconds = 100.0
+        frames[1].sensorTimestampSeconds = 100.12
+        frames[2].sensorTimestampSeconds = 100.25
+
+        let report = CaptureQualityAnalyzer.report(Self.qualityInput(frames: frames))
+        #expect(report.frameIntervalsMs.count == 2)
+        #expect(abs(report.frameIntervalsMs[0] - 120) < 0.5)
+        #expect(abs(report.frameIntervalsMs[1] - 130) < 0.5)
+        #expect(abs((report.exposureSpanMs ?? 0) - 250) < 0.5)
+    }
+
+    // The full lifecycle stores every D3 metric in the manifest — and moves zero credits.
+    @Test func finalizedBracketCarriesTheQualityReportAndCostsNothing() throws {
+        let state = AppState()
+        let property = try #require(state.properties.first)
+        let balance = state.wallet.total
+        let transactions = state.transactions.count
+        let attempt = try #require(state.beginCaptureAttempt(property: property, room: .living))
+        defer {
+            state.endCaptureSequence()
+            CaptureBundleStore.delete(clientCaptureID: attempt.id)
+        }
+
+        let plan = CaptureProfileService.plan(for: Self.capabilities(range: 8, bracket: 9))
+        let frames = try plan.exposureValues.enumerated().map { index, ev -> CaptureFrame in
+            var frame = try CaptureBundleStore.writeFrame(
+                photoData: Self.jpeg(brightness: 0.5 + ev * 0.1),
+                clientCaptureID: attempt.id,
+                sequenceIndex: index,
+                requestedEV: ev,
+                orientation: .portrait,
+                cameraID: "test-camera",
+                lensType: "Rear Wide"
+            )
+            frame.lensPosition = 0.4
+            frame.sensorTimestampSeconds = 50 + Double(index) * 0.11
+            return frame
+        }
+        let result = BracketCaptureResult(
+            plan: plan,
+            frames: frames,
+            orientation: .portrait,
+            cameraID: "test-camera",
+            lensType: "Rear Wide",
+            deviceModel: "iPhone16,1",
+            systemVersion: "iOS 26.0",
+            preparation: Self.goodPreparation,
+            lens: nil,
+            calibration: .generic,
+            startedAt: .now,
+            completedAt: .now,
+            firstFrameSeconds: 0.3,
+            bracketSeconds: 1.4,
+            persistSeconds: 0.2,
+            tapToCaptureStartMs: 210,
+            bracketDurationMs: 980
+        )
+        let tag = CameraQATag(scene: .livingRoomWindow, condition: .tripod, note: nil)
+        let manifest = try CaptureManifestBuilder.finalize(
+            result: result,
+            attempt: attempt,
+            property: property,
+            organizationID: "Test Workspace",
+            context: CaptureRecordingContext(motion: Self.stableMotion, capturedOffline: true, qaTag: tag)
+        )
+
+        #expect(manifest.state == .localReady)
+        #expect(manifest.schemaVersion == 2)
+        let quality = try #require(manifest.quality)
+        #expect(quality.qualityClass == .good)
+        #expect(quality.bracketDurationMs == 980)
+        #expect(quality.tapToCaptureStartMs == 210)
+        #expect(quality.frameIntervalsMs.count == 8)
+        #expect(quality.rollAngle == Self.stableMotion.rollAngleAtCapture)
+        #expect(quality.pitchAngle == Self.stableMotion.pitchAngleAtCapture)
+        #expect(quality.stabilityScore == Self.stableMotion.stabilityDuringCapture)
+        #expect(quality.capturedOffline)
+        #expect(quality.deviceCaptureProfileVersion == CameraCalibrationProfile.generic.versionLabel)
+        #expect(quality.calibrationStatus == .untested)
+
+        let stored = try #require(CaptureBundleStore.readManifest(clientCaptureID: attempt.id))
+        #expect(stored.quality?.qualityClass == .good)
+        #expect(stored.qaTag == tag)
+        #expect(stored.requestedLadder == plan.exposureValues)
+
+        // Calibration, stability analysis, bracketing and locks consume zero AI credits.
+        #expect(state.wallet.total == balance)
+        #expect(state.transactions.count == transactions)
+    }
+
+    // MARK: - Storage, analysis, session
+
+    @Test func storagePreflightRefusesABracketThatCannotFinish() {
+        let nine = CaptureStoragePolicy.requiredBytes(frameCount: 9, averageFrameBytes: 6_000_000)
+        #expect(nine > CaptureStoragePolicy.requiredBytes(frameCount: 3, averageFrameBytes: 6_000_000))
+        #expect(!CaptureStoragePolicy.hasRoom(frameCount: 9, averageFrameBytes: 6_000_000, availableBytes: 50_000_000))
+        #expect(CaptureStoragePolicy.hasRoom(frameCount: 9, averageFrameBytes: 6_000_000, availableBytes: 10_000_000_000))
+        // Unknown free space never blocks photography on a guess.
+        #expect(CaptureStoragePolicy.hasRoom(frameCount: 9, averageFrameBytes: nil, availableBytes: nil))
+
+        let state = AppState()
+        state.devSimulateLowStorage = true
+        let simulated = state.devAvailableBytesOverride
+        #expect(!CaptureStoragePolicy.hasRoom(frameCount: 9, averageFrameBytes: nil, availableBytes: simulated))
+    }
+
+    @Test func histogramAndClippingAreMeasured() throws {
+        let half = [UInt8](repeating: 0, count: 500) + [UInt8](repeating: 255, count: 500)
+        let analysis = try #require(FrameExposureAnalyzer.analyze(luminance: half))
+        #expect(abs(analysis.highlightClippingPercent - 50) < 0.001)
+        #expect(abs(analysis.shadowClippingPercent - 50) < 0.001)
+        #expect(abs(analysis.histogram.reduce(0, +) - 1) < 0.0001)
+        #expect(analysis.histogram.count == FrameExposureAnalyzer.binCount)
+
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("ve-analysis-\(UUID().uuidString).jpg")
+        try Self.jpeg(brightness: 0.5).write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let mid = try #require(FrameExposureAnalyzer.analyze(url: url))
+        #expect(abs(mid.meanLuminance - 0.5) < 0.08)
+        #expect(mid.highlightClippingPercent == 0)
+        #expect(mid.shadowClippingPercent == 0)
+    }
+
+    @Test func dynamicRangeReportFindsRecoveryAndRedundancy() throws {
+        func entry(_ ev: Double, mean: Double, highlight: Double, shadow: Double) -> BracketDynamicRangeReport.Entry {
+            BracketDynamicRangeReport.Entry(
+                requestedEV: ev,
+                analysis: FrameExposureAnalysis(histogram: [], meanLuminance: mean, highlightClippingPercent: highlight, shadowClippingPercent: shadow)
+            )
+        }
+        let useful = try #require(BracketDynamicRangeReport.evaluate([
+            entry(-2, mean: 0.18, highlight: 0.1, shadow: 30),
+            entry(0, mean: 0.45, highlight: 6, shadow: 8),
+            entry(2, mean: 0.75, highlight: 25, shadow: 0.2),
+        ]))
+        #expect(useful.darkestRecoversHighlights)
+        #expect(useful.brightestRecoversShadows)
+        #expect(useful.adjacentExposuresDistinct)
+        #expect(useful.verdict == "USEFUL_RANGE")
+
+        let redundant = try #require(BracketDynamicRangeReport.evaluate([
+            entry(-4, mean: 0.01, highlight: 0, shadow: 90),
+            entry(-3, mean: 0.015, highlight: 0, shadow: 85),
+            entry(0, mean: 0.45, highlight: 4, shadow: 6),
+            entry(3, mean: 0.8, highlight: 30, shadow: 0.1),
+        ]))
+        #expect(redundant.redundantPairs == [[-4, -3]])
+        #expect(redundant.unusableDarkExtreme)
+        #expect(redundant.verdict == "REDUNDANT_EXTREMES")
+    }
+
+    @Test func untaggedCapturesNeverReachTheQADataset() {
+        #expect(throws: CameraQADatasetExporter.ExportError.self) {
+            try CameraQADatasetExporter.export([])
+        }
+    }
+
+    @Test func sessionMetricsCountDuplicateAttempts() {
+        let state = AppState()
+        let id = UUID()
+        let run = CaptureRunMetric(
+            clientCaptureID: id, at: .now, succeeded: true, frameCount: 9, bracketDurationMs: 900,
+            tapToCaptureStartMs: 200, memoryFootprintMB: 120, thermalState: "NOMINAL", qualityClass: .good, failureCode: nil
+        )
+        state.recordCaptureRun(run)
+        var other = run
+        other.clientCaptureID = UUID()
+        state.recordCaptureRun(other)
+        #expect(state.cameraDiagnostics.duplicateAttemptCount == 0)
+        state.recordCaptureRun(run)
+        #expect(state.cameraDiagnostics.duplicateAttemptCount == 1)
+    }
+
+    // Background sync yields while a new bracket is being photographed.
+    @Test func syncYieldsWhileCapturing() async throws {
+        let state = AppState()
+        state.preparationSeconds = 0.05
+        let property = try #require(state.properties.first)
+        let first = try #require(state.beginCaptureAttempt(property: property, room: .living))
+        let capture = state.registerCapture(attempt: first, property: property, room: .living, frameCount: 9)
+        state.endCaptureSequence()
+
+        _ = try #require(state.beginCaptureAttempt(property: property, room: .kitchen))
+        try await Task.sleep(for: .milliseconds(1300))
+        #expect(state.captures.first { $0.id == capture.id }?.jobState != .ready)
+
+        state.endCaptureSequence()
+        try await Task.sleep(for: .milliseconds(1200))
+        #expect(state.captures.first { $0.id == capture.id }?.jobState == .ready)
+    }
+
+    @Test func newCameraErrorsHaveFriendlyCopy() {
+        let state = AppState()
+        for region in [RegionCode.pt, .br] {
+            state.selectRegion(region)
+            #expect(state.t(CameraError.focusTimeout.localizationKey) != CameraError.focusTimeout.localizationKey)
+            #expect(state.t(CameraError.insufficientStorage.localizationKey) != CameraError.insufficientStorage.localizationKey)
+            #expect(state.t("camera.hold.steady") == "Mantenha estável")
+        }
+        state.selectRegion(.pt)
+        #expect(state.t("camera.stabilizing") == "A estabilizar")
+        state.selectRegion(.br)
+        #expect(state.t("camera.stabilizing") == "Estabilizando")
+        state.selectRegion(.pt)
+    }
+
+    // MARK: - Helpers
+
+    private static func sample(
+        _ time: Double,
+        rotation: Double = 0,
+        acceleration: Double = 0,
+        gravity: (Double, Double, Double) = (0, -1, 0)
+    ) -> MotionSample {
+        MotionSample(
+            timestamp: time,
+            rotationX: rotation, rotationY: 0, rotationZ: 0,
+            accelerationX: acceleration, accelerationY: 0, accelerationZ: 0,
+            gravityX: gravity.0, gravityY: gravity.1, gravityZ: gravity.2
+        )
+    }
+
+    private static let stableMotion = CaptureMotionSnapshot(
+        sensorAvailable: true,
+        stabilityBeforeCapture: 0.95,
+        stateBeforeCapture: .stable,
+        stabilityDuringCapture: 0.92,
+        minimumStabilityDuringCapture: 0.85,
+        stabilityAtEnd: 0.9,
+        maxRotationDuringCapture: 0.05,
+        maxAccelerationDuringCapture: 0.01,
+        rollAngleAtCapture: 0.4,
+        pitchAngleAtCapture: -2.0,
+        wasLevelAtCapture: true,
+        sampleCount: 40,
+        assessment: .none
+    )
+
+    private static let goodPreparation = SequencePreparation(
+        focusStatus: .locked,
+        focusLock: .succeeded,
+        focusTimeout: false,
+        whiteBalanceLock: .succeeded,
+        whiteBalanceReference: nil,
+        exposureReferenceEstablished: true,
+        meteringStrategy: .centerWeighted,
+        preparationMs: 180
+    )
+
+    private static func qualityInput(
+        frames: [CaptureFrame],
+        motion: CaptureMotionSnapshot = stableMotion,
+        preparation: SequencePreparation = goodPreparation
+    ) -> CaptureQualityInput {
+        CaptureQualityInput(
+            frames: frames,
+            motion: motion,
+            preparation: preparation,
+            calibration: .generic,
+            requestedExposureValues: frames.map(\.requestedEV),
+            ladderSource: .standardProfile,
+            lens: nil,
+            tapToCaptureStartMs: 200,
+            bracketDurationMs: 900,
+            capturedOffline: false,
+            thermalState: "NOMINAL",
+            memoryFootprintMB: 120
+        )
+    }
+
+    private static func frame(index: Int, lens: Double?, wb: WhiteBalanceReading?, clientCaptureID: UUID) -> CaptureFrame {
+        var frame = CaptureFrame(
+            clientCaptureID: clientCaptureID,
+            sequenceIndex: index,
+            requestedEV: Double(index - 1) * 2,
+            width: 400,
+            height: 300,
+            exifOrientation: 6,
+            orientation: .portrait,
+            cameraID: "test-camera",
+            lensType: "Rear Wide",
+            fileName: "frame_\(index).jpg",
+            byteCount: 100,
+            checksum: "checksum-\(index)",
+            capturedAt: Date(timeIntervalSinceReferenceDate: 1000 + Double(index) * 0.1)
+        )
+        frame.lensPosition = lens
+        frame.whiteBalance = wb
+        return frame
+    }
+
+    private static func capabilities(range: Double, bracket: Int) -> CameraExposureCapabilities {
+        CameraExposureCapabilities(
+            deviceModel: "iPhone16,1",
+            systemVersion: "iOS 26.0",
+            activeLens: "Rear Wide",
+            cameraID: "test-camera",
+            activeFormat: "4032×3024",
+            minExposureBias: -range,
+            maxExposureBias: range,
+            maxBracketCount: bracket,
+            supportsBracketCapture: bracket >= 2,
+            supportsExposureLock: true,
+            supportsCustomExposure: true,
+            supportsFocusLock: true,
+            supportsWhiteBalanceLock: true,
+            supportsLensStabilization: true
+        )
+    }
+
+    private static func manifest(
+        frames: [CaptureFrame],
+        attempt: CaptureAttempt,
+        property: Property,
+        profile: CaptureProfile
+    ) -> CaptureManifest {
+        CaptureManifest(
+            captureID: nil,
+            clientCaptureID: attempt.id,
+            organizationID: "Test Workspace",
+            propertyID: property.id,
+            roomID: attempt.room.rawValue,
+            device: "iPhone16,1",
+            iOSVersion: "iOS 26.0",
+            appVersion: "1.0.0 (1)",
+            cameraID: "test-camera",
+            lensType: "Rear Wide",
+            captureProfile: profile,
+            expectedFrameCount: frames.count,
+            actualFrameCount: frames.count,
+            segmentCount: 1,
+            orientation: .portrait,
+            focusLockSucceeded: .succeeded,
+            whiteBalanceLockSucceeded: .succeeded,
+            state: .localValidating,
+            startedAt: attempt.startedAt,
+            completedAt: nil,
+            frames: frames
+        )
+    }
+
     private static func jpeg(brightness: Double) -> Data {
         let size = CGSize(width: 400, height: 300)
         let level = Swift.max(0.02, Swift.min(0.98, brightness))

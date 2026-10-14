@@ -17,7 +17,8 @@ enum CaptureProfile: String, Codable, Hashable, Sendable, CaseIterable, Identifi
     /// Developer-panel label only.
     var devLabel: String { rawValue }
 
-    var exposureValues: [Int] {
+    /// Floating-point EV: calibrated devices may use fractional ladders (±2.5, ±0.5, …).
+    var exposureValues: [Double] {
         switch self {
         case .full9: [-4, -3, -2, -1, 0, 1, 2, 3, 4]
         case .standard7: [-3, -2, -1, 0, 1, 2, 3]
@@ -31,11 +32,23 @@ enum CaptureProfile: String, Codable, Hashable, Sendable, CaseIterable, Identifi
 
     var isBracket: Bool { self != .single }
 
-    var minimumEV: Int { exposureValues.min() ?? 0 }
-    var maximumEV: Int { exposureValues.max() ?? 0 }
+    var minimumEV: Double { exposureValues.min() ?? 0 }
+    var maximumEV: Double { exposureValues.max() ?? 0 }
 
     /// EV 0 is mandatory. A bracket without it is never accepted.
-    var includesReferenceExposure: Bool { exposureValues.contains(0) }
+    var includesReferenceExposure: Bool { exposureValues.contains { abs($0) < 0.001 } }
+
+    /// The standard profile family a ladder of `count` frames belongs to. A calibrated device
+    /// ladder keeps its own values; the family only names it in reports.
+    static func family(frameCount count: Int) -> CaptureProfile {
+        switch count {
+        case 9...: .full9
+        case 7...8: .standard7
+        case 5...6: .compact5
+        case 2...4: .basic3
+        default: .single
+        }
+    }
 
     /// Preferred first. Selection walks this order and stops at the first safely supported entry.
     static let preferenceOrder: [CaptureProfile] = [.full9, .standard7, .compact5, .basic3, .single]
@@ -49,11 +62,20 @@ enum CaptureProfile: String, Codable, Hashable, Sendable, CaseIterable, Identifi
     }
 
     /// `-4`, `0`, `+4` — used in file names and the developer frame inspector.
-    static func evLabel(_ value: Double) -> String {
-        let rounded = (value * 10).rounded() / 10
-        let whole = rounded == rounded.rounded() ? String(Int(rounded)) : String(format: "%.1f", abs(rounded))
-        if rounded > 0 { return "+\(whole.replacingOccurrences(of: "-", with: ""))" }
-        return whole
+    /// Fractional values keep their sign and up to two decimals (`-2.5`, `+0.25`).
+    nonisolated static func evLabel(_ value: Double) -> String {
+        let rounded = (value * 100).rounded() / 100
+        let magnitude = abs(rounded)
+        var digits: String
+        if magnitude == magnitude.rounded() {
+            digits = String(Int(magnitude))
+        } else {
+            digits = String(format: "%.2f", magnitude)
+            while digits.hasSuffix("0") { digits.removeLast() }
+        }
+        if rounded > 0 { return "+" + digits }
+        if rounded < 0 { return "-" + digits }
+        return "0"
     }
 }
 
@@ -115,11 +137,18 @@ struct CameraExposureCapabilities: Codable, Hashable, Sendable {
 /// with focus, white balance and the exposure reference held for the entire attempt.
 struct BracketPlan: Codable, Hashable, Sendable {
     var profile: CaptureProfile
-    var segments: [[Int]]
+    var segments: [[Double]]
     /// Why this profile was chosen. Developer panel only.
     var reason: String
+    var ladderSource: LadderSource = .standardProfile
+    /// Calibration profile id and version this plan was derived from.
+    var calibrationVersion: String = CameraCalibrationProfile.generic.versionLabel
 
-    var exposureValues: [Int] { segments.flatMap { $0 } }
+    var exposureValues: [Double] { segments.flatMap { $0 } }
+
+    var ladderDescription: String {
+        exposureValues.map { CaptureProfile.evLabel($0) }.joined(separator: " ")
+    }
     var expectedFrameCount: Int { exposureValues.count }
     var isSegmented: Bool { segments.count > 1 }
 

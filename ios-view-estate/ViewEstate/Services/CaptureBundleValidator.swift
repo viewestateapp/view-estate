@@ -9,12 +9,13 @@ import Foundation
 enum CaptureBundleValidator {
     /// - Returns: `nil` when the bundle is valid, otherwise the normalised failure code.
     static func validate(_ manifest: CaptureManifest, deepVerify: Bool = false) -> CameraError? {
-        guard manifest.schemaVersion == CaptureManifest.currentSchemaVersion else {
+        guard CaptureManifest.supportedSchemaVersions.contains(manifest.schemaVersion) else {
             return .manifestInvalid
         }
 
         let frames = manifest.orderedFrames
-        let expected = manifest.captureProfile.exposureValues
+        let expected = manifest.requestedLadder
+        guard expected.contains(where: { abs($0) < 0.001 }) else { return .ev0Missing }
 
         // Every frame belongs to this shutter action. Attempts are never mixed.
         guard frames.allSatisfy({ $0.clientCaptureID == manifest.clientCaptureID }) else {
@@ -34,9 +35,10 @@ enum CaptureBundleValidator {
         guard Set(indexes).count == indexes.count, indexes == Array(0..<frames.count) else {
             return .manifestInvalid
         }
-        guard frames.map({ Int($0.requestedEV.rounded()) }) == expected else {
-            return .manifestInvalid
+        let matchesLadder = zip(frames, expected).allSatisfy { frame, value in
+            abs(frame.requestedEV - value) < 0.01
         }
+        guard matchesLadder else { return .manifestInvalid }
 
         guard let first = frames.first else { return .frameMissing }
 

@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreMedia
 import ImageIO
 import Observation
 import UIKit
@@ -12,14 +13,22 @@ struct BracketCaptureResult: Sendable {
     var lensType: String
     var deviceModel: String
     var systemVersion: String
-    var focusLock: LockOutcome
-    var whiteBalanceLock: LockOutcome
+    var preparation: SequencePreparation
+    var lens: CaptureLensRecord?
+    var calibration: CameraCalibrationProfile
     var startedAt: Date
     var completedAt: Date
     /// Real measurements, in seconds.
     var firstFrameSeconds: Double?
     var bracketSeconds: Double
     var persistSeconds: Double
+    /// Shutter tap → first native capture request, ms.
+    var tapToCaptureStartMs: Double?
+    /// First capture request → last frame delivered, ms.
+    var bracketDurationMs: Double?
+
+    var focusLock: LockOutcome { preparation.focusLock }
+    var whiteBalanceLock: LockOutcome { preparation.whiteBalanceLock }
 
     var isComplete: Bool { frames.count == plan.expectedFrameCount }
 }
@@ -51,6 +60,14 @@ final class CameraService {
     private(set) var plan: BracketPlan = .single
     /// Last normalised failure, ready to be shown as friendly copy.
     private(set) var failure: CameraError?
+    /// Calibration resolved for this device and camera.
+    private(set) var calibration: CameraCalibrationProfile = .generic
+    /// Internal focus state; developer diagnostics only.
+    private(set) var focusStatus: FocusStatus = .unavailable
+    /// The physical lens in use.
+    private(set) var activeLens: PreferredLens?
+    /// Measured average size of one exposure, for the storage preflight.
+    var averageFrameBytes: Int64?
 
     /// The live session the preview layer binds to.
     let session = AVCaptureSession()
@@ -64,15 +81,18 @@ final class CameraService {
     private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
     private var previewRotationObservation: NSKeyValueObservation?
     private var captureRotationObservation: NSKeyValueObservation?
+    private var focusObservation: NSKeyValueObservation?
     private weak var previewLayer: AVCaptureVideoPreviewLayer?
     private var isConfigured = false
     /// AVFoundation only holds its delegate for the duration of a capture; keep it alive here.
     private var captureDelegate: SequenceCaptureDelegate?
     private var captureRotationAngle: CGFloat = 90
-    private var interruptionObservers: [NSObjectProtocol] = []
+    private var sessionObservers: [NSObjectProtocol] = []
     /// Set by a session interruption, a runtime error or the app leaving the foreground.
     private var interruptionFlag = false
     private var isCaptureInFlight = false
+    /// The camera screen wants the session live; drives recovery after interruptions.
+    private var wantsRunning = false
 
     // MARK: - Permission
 
@@ -110,13 +130,24 @@ final class CameraService {
     // MARK: - Lifecycle
 
     /// Requests access, configures the session once and starts the preview.
-    func start() async {
+    ///
+    /// - Parameter lensOverride: development-only lens choice (the ultra-wide test); otherwise
+    ///   the calibration profile's preferred lens is used.
+    func start(lensOverride: PreferredLens? = nil) async {
+        wantsRunning = true
         let access = await requestAccess()
         guard access.isAuthorized else { return }
 
+        // The lens is part of the calibration, so it is resolved before the camera is chosen.
+        calibration = CameraCalibrationCatalog.resolve(
+            deviceModel: Self.deviceModelName(),
+            systemVersion: UIDevice.current.systemVersion
+        )
+        let lens = lensOverride ?? calibration.preferredLens
+
         if !isConfigured {
             do {
-                try await configure()
+                try await configure(lens: lens)
                 isConfigured = true
                 failure = nil
             } catch {
@@ -125,6 +156,8 @@ final class CameraService {
                 VELog.cameraError(normalized.code, "configuration")
                 return
             }
+        } else if lens != activeLens, !isCaptureInFlight {
+            await switchLens(to: lens)
         }
 
         await withCheckedContinuation { continuation in
@@ -132,6 +165,11 @@ final class CameraService {
                 if !session.isRunning { session.startRunning() }
                 continuation.resume()
             }
+        }
+        guard wantsRunning else {
+            // The screen closed while the session was starting.
+            stop()
+            return
         }
         isRunning = session.isRunning
         applyRotationAngles()
@@ -142,6 +180,7 @@ final class CameraService {
 
     /// Stops the session when the camera leaves the screen or the app goes to the background.
     func stop() {
+        wantsRunning = false
         guard isConfigured else { return }
         isRunning = false
         sessionQueue.async { [session] in
@@ -183,18 +222,17 @@ final class CameraService {
     }
 
     deinit {
-        for observer in interruptionObservers {
+        for observer in sessionObservers {
             NotificationCenter.default.removeObserver(observer)
         }
     }
 
     // MARK: - Configuration
 
-    private func configure() async throws {
-        guard let device = Self.preferredCamera() else {
+    private func configure(lens: PreferredLens) async throws {
+        guard let device = Self.preferredCamera(lens: lens) else {
             throw CameraError.initializationFailed
         }
-        self.device = device
 
         let input: AVCaptureDeviceInput
         do {
@@ -231,26 +269,70 @@ final class CameraService {
             }
         }
 
-        videoInput = input
-        makeRotationCoordinator(for: device)
-        setup = Self.describe(device)
-        observeInterruptions()
-        VELog.camera("session configured device=\(device.localizedName) preset=photo")
+        adopt(device: device, input: input)
+        observeSession()
+        VELog.camera("session configured device=\(device.localizedName) preset=photo lens=\(activeLens?.devLabel ?? "—")")
     }
 
-    /// The main rear camera. Lenses are never switched automatically: a single physical device is
-    /// chosen once, so no frame of a bracket can come from a different lens.
+    /// Swaps the physical camera between attempts — never during one.
+    private func switchLens(to lens: PreferredLens) async {
+        guard let current = videoInput,
+              let next = Self.preferredCamera(lens: lens),
+              next.uniqueID != current.device.uniqueID,
+              let input = try? AVCaptureDeviceInput(device: next)
+        else { return }
+
+        let swapped: Bool = await withCheckedContinuation { continuation in
+            sessionQueue.async { [session] in
+                session.beginConfiguration()
+                session.removeInput(current)
+                let added = session.canAddInput(input)
+                session.addInput(added ? input : current)
+                session.commitConfiguration()
+                continuation.resume(returning: added)
+            }
+        }
+        guard swapped else { return }
+        adopt(device: next, input: input)
+        VELog.camera("lens switched to \(activeLens?.devLabel ?? "—") between attempts")
+    }
+
+    private func adopt(device: AVCaptureDevice, input: AVCaptureDeviceInput) {
+        self.device = device
+        videoInput = input
+        activeLens = Self.lens(of: device)
+        makeRotationCoordinator(for: device)
+        setup = Self.describe(device)
+        observeFocus(device)
+    }
+
+    /// The preferred rear camera. Lenses are never switched automatically during an attempt: a
+    /// single physical device is chosen up front, so no frame of a bracket can come from another
+    /// lens. Ultra-wide is only used when a calibration (or the developer lens test) asks for it.
     /// External devices are included so an injected camera is found when no built-in one exists.
-    private static func preferredCamera() -> AVCaptureDevice? {
+    private static func preferredCamera(lens: PreferredLens) -> AVCaptureDevice? {
+        if lens == .ultraWide,
+           let ultraWide = AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back) {
+            return ultraWide
+        }
         let discovery = AVCaptureDevice.DiscoverySession(
             deviceTypes: [.builtInWideAngleCamera, .external],
             mediaType: .video,
             position: .unspecified
         )
         let devices = discovery.devices
-        return devices.first { $0.position == .back }
+        return devices.first { $0.position == .back && $0.deviceType == .builtInWideAngleCamera }
+            ?? devices.first { $0.position == .back }
             ?? devices.first { $0.deviceType == .external }
             ?? devices.first
+    }
+
+    private static func lens(of device: AVCaptureDevice) -> PreferredLens? {
+        switch device.deviceType {
+        case .builtInWideAngleCamera: .wide
+        case .builtInUltraWideCamera: .ultraWide
+        default: nil
+        }
     }
 
     private static func describe(_ device: AVCaptureDevice) -> CameraSetup {
@@ -266,7 +348,7 @@ final class CameraService {
     }
 
     /// Hardware identifier (`iPhone16,1`), so a report names the real device, not "iPhone".
-    private static func deviceModelName() -> String {
+    nonisolated static func deviceModelName() -> String {
         var info = utsname()
         uname(&info)
         let machine = info.machine
@@ -274,7 +356,7 @@ final class CameraService {
             let bytes = buffer.prefix { $0 != 0 }
             return String(decoding: bytes, as: UTF8.self)
         }
-        return identifier.isEmpty ? UIDevice.current.model : identifier
+        return identifier.isEmpty ? "iPhone" : identifier
     }
 
     private static func lensLabel(_ device: AVCaptureDevice) -> String {
@@ -306,6 +388,13 @@ final class CameraService {
             return
         }
 
+        // Re-resolved with the physical camera: a profile may be pinned to one camera.
+        calibration = CameraCalibrationCatalog.resolve(
+            deviceModel: Self.deviceModelName(),
+            systemVersion: UIDevice.current.systemVersion,
+            cameraUniqueID: device.uniqueID
+        )
+
         let format = device.activeFormat
         let dimensions = format.supportedMaxPhotoDimensions.first
         let resolution = dimensions.map { "\($0.width)×\($0.height)" } ?? "—"
@@ -327,32 +416,97 @@ final class CameraService {
             supportsLensStabilization: photoOutput.isLensStabilizationDuringBracketedCaptureSupported
         )
         capabilities = detected
-        plan = CaptureProfileService.plan(for: detected)
+        plan = CaptureProfileService.plan(for: detected, calibration: calibration)
         VELog.camera(
             "capabilities bias=\(detected.minExposureBias)…\(detected.maxExposureBias) "
                 + "maxBracket=\(detected.maxBracketCount) profile=\(plan.profile.devLabel) "
-                + "segments=\(plan.segments.count)"
+                + "segments=\(plan.segments.count) calibration=\(calibration.versionLabel)"
         )
     }
 
-    // MARK: - Interruptions
+    // MARK: - Session events & recovery
 
-    private func observeInterruptions() {
-        guard interruptionObservers.isEmpty else { return }
+    private func observeSession() {
+        guard sessionObservers.isEmpty else { return }
         let center = NotificationCenter.default
-        let names: [Notification.Name] = [
-            AVCaptureSession.wasInterruptedNotification,
-            AVCaptureSession.runtimeErrorNotification,
-        ]
-        for name in names {
-            let observer = center.addObserver(forName: name, object: session, queue: .main) { [weak self] _ in
+
+        sessionObservers.append(
+            center.addObserver(forName: AVCaptureSession.wasInterruptedNotification, object: session, queue: .main) { [weak self] _ in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     self.markInterrupted()
-                    VELog.camera("session event \(name.rawValue) duringCapture=\(self.isCaptureInFlight)")
+                    self.isRunning = false
+                    VELog.camera("session interrupted duringCapture=\(self.isCaptureInFlight)")
                 }
             }
-            interruptionObservers.append(observer)
+        )
+
+        sessionObservers.append(
+            center.addObserver(forName: AVCaptureSession.interruptionEndedNotification, object: session, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    VELog.camera("session interruption ended")
+                    self?.recoverSession()
+                }
+            }
+        )
+
+        sessionObservers.append(
+            center.addObserver(forName: AVCaptureSession.runtimeErrorNotification, object: session, queue: .main) { [weak self] notification in
+                let code = (notification.userInfo?[AVCaptureSessionErrorKey] as? AVError)?.code
+                let mediaServicesReset = code == .mediaServicesWereReset
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.markInterrupted()
+                    self.isRunning = false
+                    VELog.camera("session runtime error mediaServicesReset=\(mediaServicesReset)")
+                    // Media services reset (or a transient error) is recoverable by restarting.
+                    self.recoverSession()
+                }
+            }
+        )
+
+        for name in [AVCaptureSession.didStartRunningNotification, AVCaptureSession.didStopRunningNotification] {
+            sessionObservers.append(
+                center.addObserver(forName: name, object: session, queue: .main) { [weak self] _ in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.isRunning = self.session.isRunning
+                    }
+                }
+            )
+        }
+    }
+
+    /// Restarts the session after an interruption, a lock/unlock or a media-services reset —
+    /// only if the camera screen still wants it. Never creates a capture record.
+    private func recoverSession() {
+        guard wantsRunning, isConfigured, access.isAuthorized else { return }
+        sessionQueue.async { [session] in
+            if !session.isRunning { session.startRunning() }
+            let running = session.isRunning
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.isRunning = running
+                if running {
+                    self.applyRotationAngles()
+                    self.readCapabilities()
+                }
+            }
+        }
+    }
+
+    private func observeFocus(_ device: AVCaptureDevice) {
+        focusStatus = device.isFocusModeSupported(.autoFocus) ? .ready : .unavailable
+        guard device.isFocusModeSupported(.autoFocus) else {
+            focusObservation = nil
+            return
+        }
+        focusObservation = device.observe(\.isAdjustingFocus, options: [.new]) { [weak self] camera, _ in
+            let adjusting = camera.isAdjustingFocus
+            Task { @MainActor [weak self] in
+                guard let self, !self.isCaptureInFlight else { return }
+                self.focusStatus = adjusting ? .searching : .ready
+            }
         }
     }
 
@@ -401,13 +555,20 @@ final class CameraService {
     /// Photographs the planned exposure ladder for ONE shutter action.
     ///
     /// Composition is held still for the whole sequence: one physical camera, zoom 1.0, focus and
-    /// white balance locked where the hardware allows it, one orientation captured up front, and
-    /// exposure varied only by the requested bias relative to a settled EV 0 reference. Frames are
-    /// written to the capture bundle as they arrive, so the device never holds the whole bracket
-    /// in memory.
+    /// white balance locked where the hardware allows it, one orientation frozen at the tap, and
+    /// exposure varied only by the requested bias relative to a settled, centre-metered EV 0
+    /// reference. Frames are written to the capture bundle as they arrive, so the device never
+    /// holds the whole bracket in memory.
     ///
+    /// - Parameters:
+    ///   - tapAt: when the shutter was tapped, for tap-to-capture latency.
+    ///   - availableBytesOverride: development-only low-storage simulation.
     /// - Throws: `BracketCaptureFailure` carrying a normalised code and whatever was persisted.
-    func captureBracket(clientCaptureID: UUID) async throws -> BracketCaptureResult {
+    func captureBracket(
+        clientCaptureID: UUID,
+        tapAt: Date = .now,
+        availableBytesOverride: Int64? = nil
+    ) async throws -> BracketCaptureResult {
         guard access.isAuthorized else {
             throw BracketCaptureFailure(code: .permissionDenied, partial: emptyResult(clientCaptureID))
         }
@@ -416,9 +577,23 @@ final class CameraService {
         }
 
         let plan = self.plan
+        let calibration = self.calibration
+
+        // Never begin a bracket that is likely to run out of space halfway through.
+        let available = availableBytesOverride ?? CaptureStoragePolicy.availableBytes()
+        guard CaptureStoragePolicy.hasRoom(
+            frameCount: plan.expectedFrameCount,
+            averageFrameBytes: averageFrameBytes,
+            availableBytes: available
+        ) else {
+            failure = .insufficientStorage
+            VELog.cameraError(CameraError.insufficientStorage.code, "frames=\(plan.expectedFrameCount)")
+            throw BracketCaptureFailure(code: .insufficientStorage, partial: emptyResult(clientCaptureID))
+        }
+
         let startedAt = Date()
-        // Orientation is decided once, at the top of the attempt: rotating the phone mid-bracket
-        // never gives individual frames different orientations.
+        // Orientation is frozen at the top of the attempt: rotating the phone mid-bracket never
+        // gives individual frames different orientations.
         let angle = captureRotationAngle
         let orientation = CaptureOrientation(videoRotationAngle: angle)
         let cameraID = device.uniqueID
@@ -432,10 +607,31 @@ final class CameraService {
             throw BracketCaptureFailure(code: .initializationFailed, partial: emptyResult(clientCaptureID))
         }
 
-        let locks = await prepareForSequence()
+        let preparation = await prepareForSequence(strategy: calibration)
+
+        if preparation.focusTimeout, calibration.focusStrategy.onTimeout == .requireRetry {
+            restoreContinuousModes()
+            var partial = emptyResult(clientCaptureID)
+            partial.preparation = preparation
+            failure = .focusTimeout
+            VELog.cameraError(CameraError.focusTimeout.code, "policy=requireRetry")
+            throw BracketCaptureFailure(code: .focusTimeout, partial: partial)
+        }
+
+        let context = SequenceContext(
+            clientCaptureID: clientCaptureID,
+            orientation: orientation,
+            cameraID: cameraID,
+            lensType: lensType,
+            isBracket: plan.profile.isBracket,
+            probe: DeviceProbe(device)
+        )
+
         var frames: [CaptureFrame] = []
         var persistSeconds: Double = 0
         var firstPhotoAt: Date?
+        var firstRequestAt: Date?
+        var lastFrameAt: Date?
         var failureCode: CameraError?
 
         segments: for segment in plan.segments {
@@ -444,24 +640,18 @@ final class CameraService {
                 break segments
             }
 
-            let baseIndex = frames.count
+            if firstRequestAt == nil { firstRequestAt = Date() }
             let outcome = await captureSegment(
                 exposures: segment,
-                baseIndex: baseIndex,
+                baseIndex: frames.count,
                 rotationAngle: angle,
-                context: SequenceContext(
-                    clientCaptureID: clientCaptureID,
-                    orientation: orientation,
-                    cameraID: cameraID,
-                    lensType: lensType,
-                    lensPosition: Double(device.lensPosition),
-                    isBracket: plan.profile.isBracket
-                )
+                context: context
             )
 
             frames.append(contentsOf: outcome.frames)
             persistSeconds += outcome.persistSeconds
             if firstPhotoAt == nil { firstPhotoAt = outcome.firstPhotoAt }
+            lastFrameAt = outcome.lastPhotoAt ?? lastFrameAt
 
             if let code = outcome.failure {
                 failureCode = code
@@ -473,6 +663,7 @@ final class CameraService {
             }
         }
 
+        let lens = lensRecord(for: device, frames: frames)
         restoreContinuousModes()
 
         let completedAt = Date()
@@ -484,13 +675,18 @@ final class CameraService {
             lensType: lensType,
             deviceModel: Self.deviceModelName(),
             systemVersion: "iOS " + UIDevice.current.systemVersion,
-            focusLock: locks.focus,
-            whiteBalanceLock: locks.whiteBalance,
+            preparation: preparation,
+            lens: lens,
+            calibration: calibration,
             startedAt: startedAt,
             completedAt: completedAt,
             firstFrameSeconds: firstPhotoAt.map { $0.timeIntervalSince(startedAt) },
             bracketSeconds: completedAt.timeIntervalSince(startedAt),
-            persistSeconds: persistSeconds
+            persistSeconds: persistSeconds,
+            tapToCaptureStartMs: firstRequestAt.map { $0.timeIntervalSince(tapAt) * 1000 },
+            bracketDurationMs: firstRequestAt.flatMap { start in
+                (lastFrameAt ?? completedAt).timeIntervalSince(start) * 1000
+            }
         )
 
         if interruptionFlag { failureCode = .captureInterrupted }
@@ -509,10 +705,13 @@ final class CameraService {
         }
 
         failure = nil
+        if !frames.isEmpty {
+            averageFrameBytes = Int64(frames.reduce(0) { $0 + $1.byteCount } / frames.count)
+        }
         VELog.camera(
             "bracket \(plan.profile.devLabel) frames=\(result.frames.count) "
-                + "in \(String(format: "%.2f", result.bracketSeconds))s "
-                + "focusLock=\(locks.focus.devLabel) wbLock=\(locks.whiteBalance.devLabel)"
+                + "duration=\(Int(result.bracketDurationMs ?? 0))ms tap=\(Int(result.tapToCaptureStartMs ?? 0))ms "
+                + "focus=\(preparation.focusStatus.devLabel) wbLock=\(preparation.whiteBalanceLock.devLabel)"
         )
         return result
     }
@@ -527,20 +726,39 @@ final class CameraService {
             lensType: device.map(Self.lensLabel) ?? "—",
             deviceModel: Self.deviceModelName(),
             systemVersion: "iOS " + UIDevice.current.systemVersion,
-            focusLock: .unsupported,
-            whiteBalanceLock: .unsupported,
+            preparation: .unavailable,
+            lens: nil,
+            calibration: calibration,
             startedAt: now,
             completedAt: now,
             firstFrameSeconds: nil,
             bracketSeconds: 0,
-            persistSeconds: 0
+            persistSeconds: 0,
+            tapToCaptureStartMs: nil,
+            bracketDurationMs: nil
+        )
+    }
+
+    private func lensRecord(for device: AVCaptureDevice, frames: [CaptureFrame]) -> CaptureLensRecord {
+        let reference = frames.first(where: \.isReferenceExposure) ?? frames.first
+        return CaptureLensRecord(
+            cameraUniqueID: device.uniqueID,
+            deviceType: device.deviceType.rawValue,
+            lens: Self.lens(of: device),
+            focalLengthMM: reference?.focalLengthMM,
+            focalLengthEquivalentMM: reference?.metadata["focalLength35mm"].flatMap(Double.init),
+            fieldOfViewDegrees: Double(device.activeFormat.videoFieldOfView),
+            zoomFactor: Double(device.videoZoomFactor),
+            lensAperture: Double(device.lensAperture),
+            lensModel: reference?.metadata["lensModel"],
+            calibrationDataSupported: photoOutput.isCameraCalibrationDataDeliverySupported
         )
     }
 
     /// One native capture request: a bracket of up to `maxBracketCount` exposures, or a single
     /// photograph when the camera cannot bracket at all.
     private func captureSegment(
-        exposures: [Int],
+        exposures: [Double],
         baseIndex: Int,
         rotationAngle: CGFloat,
         context: SequenceContext
@@ -560,10 +778,9 @@ final class CameraService {
             }
             // Likewise, a bias outside the camera's reported envelope is rejected fatally.
             if let capabilities {
-                let lower = capabilities.minExposureBias - 0.05
-                let upper = capabilities.maxExposureBias + 0.05
-                let inRange = exposures.allSatisfy { Double($0) >= lower && Double($0) <= upper }
-                guard inRange else { return SegmentOutcome(failure: .exposureRangeUnsupported) }
+                guard CaptureProfileService.fits(exposures, capabilities: capabilities) else {
+                    return SegmentOutcome(failure: .exposureRangeUnsupported)
+                }
             }
         }
 
@@ -639,13 +856,18 @@ final class CameraService {
 
     // MARK: - Holding the composition still
 
-    /// Establishes focus, white balance and a stable EV 0 reference, then holds them.
+    /// Establishes focus, white balance and a stable, centre-metered EV 0 reference, then holds
+    /// focus and white balance for the whole sequence.
     ///
     /// Exposure itself deliberately stays automatic: the bracket biases are relative to the
     /// camera's own metering, so locking it would risk nine identical frames instead of a real
-    /// exposure ladder. What must not drift — focus and white balance — is locked.
-    private func prepareForSequence() async -> (focus: LockOutcome, whiteBalance: LockOutcome) {
-        guard let device else { return (.unsupported, .unsupported) }
+    /// exposure ladder. The metering point is fixed at the centre and the reference is allowed to
+    /// settle once — it is never re-metered per frame. Every wait has a short, measured ceiling.
+    private func prepareForSequence(strategy calibration: CameraCalibrationProfile) async -> SequencePreparation {
+        guard let device else { return .unavailable }
+        let started = Date()
+        let focusStrategy = calibration.focusStrategy
+        let point = CGPoint(x: focusStrategy.pointX, y: focusStrategy.pointY)
 
         // Zoom is pinned to the physical lens: no digital zoom, and no change between frames.
         // The factor is clamped into the camera's own range — an out-of-range value is fatal.
@@ -658,35 +880,68 @@ final class CameraService {
             camera.videoZoomFactor = target
         }
 
-        var focus = LockOutcome.unsupported
+        // 1–3: establish autofocus on the composition centre, let it settle, then lock it.
+        var focusStatus = FocusStatus.unavailable
+        var focusLock = LockOutcome.unsupported
+        var focusTimeout = false
         if device.isFocusModeSupported(.autoFocus) {
+            self.focusStatus = .searching
             configure(device) { camera in
                 if camera.isFocusPointOfInterestSupported {
-                    camera.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5)
+                    camera.focusPointOfInterest = point
                 }
                 camera.focusMode = .autoFocus
             }
-            await settle { [weak device] in device?.isAdjustingFocus ?? false }
+            let settled = await settle(
+                startWindow: 0.15,
+                timeout: focusStrategy.settleTimeoutMs / 1000
+            ) { [weak device] in device?.isAdjustingFocus ?? false }
+            focusTimeout = !settled
+            focusStatus = settled ? .ready : .failed
         }
         if device.isFocusModeSupported(.locked) {
-            focus = configure(device) { $0.focusMode = .locked } ? .succeeded : .failed
+            let locked = configure(device) { $0.focusMode = .locked }
+            focusLock = locked ? .succeeded : .failed
+            if locked { focusStatus = .locked } else if focusStatus != .unavailable { focusStatus = .failed }
         }
+        self.focusStatus = focusStatus
 
-        var whiteBalance = LockOutcome.unsupported
+        // White balance: let auto white balance settle, then lock it for the bracket.
+        var whiteBalanceLock = LockOutcome.unsupported
         if device.isWhiteBalanceModeSupported(.autoWhiteBalance) {
             configure(device) { $0.whiteBalanceMode = .autoWhiteBalance }
-            await settle { [weak device] in device?.isAdjustingWhiteBalance ?? false }
+            await settle(timeout: calibration.whiteBalanceStrategy.settleTimeoutMs / 1000) { [weak device] in
+                device?.isAdjustingWhiteBalance ?? false
+            }
         }
         if device.isWhiteBalanceModeSupported(.locked) {
-            whiteBalance = configure(device) { $0.whiteBalanceMode = .locked } ? .succeeded : .failed
+            whiteBalanceLock = configure(device) { $0.whiteBalanceMode = .locked } ? .succeeded : .failed
+        }
+        let whiteBalanceReference = Self.whiteBalanceReading(device)
+
+        // EV 0 reference: predictable centre metering, settled once, never re-metered per frame.
+        configure(device) { camera in
+            if camera.isExposurePointOfInterestSupported {
+                camera.exposurePointOfInterest = point
+            }
+            if camera.isExposureModeSupported(.continuousAutoExposure) {
+                camera.exposureMode = .continuousAutoExposure
+            }
+        }
+        let exposureSettled = await settle(timeout: calibration.exposureStrategy.settleTimeoutMs / 1000) { [weak device] in
+            device?.isAdjustingExposure ?? false
         }
 
-        if device.isExposureModeSupported(.continuousAutoExposure) {
-            configure(device) { $0.exposureMode = .continuousAutoExposure }
-        }
-        await settle { [weak device] in device?.isAdjustingExposure ?? false }
-
-        return (focus, whiteBalance)
+        return SequencePreparation(
+            focusStatus: focusStatus,
+            focusLock: focusLock,
+            focusTimeout: focusTimeout,
+            whiteBalanceLock: whiteBalanceLock,
+            whiteBalanceReference: whiteBalanceReference,
+            exposureReferenceEstablished: exposureSettled,
+            meteringStrategy: calibration.exposureStrategy.metering,
+            preparationMs: Date().timeIntervalSince(started) * 1000
+        )
     }
 
     /// Returns the camera to normal behaviour once the sequence is over.
@@ -700,6 +955,7 @@ final class CameraService {
                 camera.whiteBalanceMode = .continuousAutoWhiteBalance
             }
         }
+        focusStatus = device.isFocusModeSupported(.autoFocus) ? .ready : .unavailable
     }
 
     @discardableResult
@@ -715,14 +971,55 @@ final class CameraService {
     }
 
     /// Waits — briefly and with a hard ceiling — for the camera to stop adjusting.
+    ///
+    /// `startWindow` gives a just-triggered adjustment (an autofocus scan) a moment to begin, so
+    /// a scan that has not started yet is not mistaken for one that already finished.
+    /// - Returns: `true` when the camera settled, `false` on timeout.
+    @discardableResult
     private func settle(
-        timeout: TimeInterval = 1.2,
+        startWindow: TimeInterval = 0,
+        timeout: TimeInterval,
         while isAdjusting: @escaping () -> Bool
-    ) async {
-        let deadline = Date().addingTimeInterval(timeout)
-        while isAdjusting(), Date() < deadline {
-            try? await Task.sleep(for: .milliseconds(30))
+    ) async -> Bool {
+        let begin = Date()
+        if startWindow > 0 {
+            let startDeadline = begin.addingTimeInterval(startWindow)
+            while !isAdjusting(), Date() < startDeadline {
+                try? await Task.sleep(for: .milliseconds(15))
+            }
         }
+        let deadline = begin.addingTimeInterval(max(timeout, startWindow))
+        while isAdjusting(), Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        return !isAdjusting()
+    }
+
+    /// Current white balance as raw gains plus temperature/tint — only on cameras that expose
+    /// white balance control, and only through conversions they accept.
+    nonisolated static func whiteBalanceReading(_ device: AVCaptureDevice) -> WhiteBalanceReading? {
+        guard device.isWhiteBalanceModeSupported(.locked) else { return nil }
+        let gains = device.deviceWhiteBalanceGains
+        guard gains.redGain > 0, gains.greenGain > 0, gains.blueGain > 0 else { return nil }
+        var reading = WhiteBalanceReading(
+            redGain: Double(gains.redGain),
+            greenGain: Double(gains.greenGain),
+            blueGain: Double(gains.blueGain)
+        )
+        let maxGain = device.maxWhiteBalanceGain
+        if maxGain >= 1 {
+            // Conversion only accepts gains inside 1…max; anything else is a fatal exception.
+            func clamp(_ value: Float) -> Float { min(maxGain, max(1, value)) }
+            let normalized = AVCaptureDevice.WhiteBalanceGains(
+                redGain: clamp(gains.redGain),
+                greenGain: clamp(gains.greenGain),
+                blueGain: clamp(gains.blueGain)
+            )
+            let values = device.temperatureAndTintValues(for: normalized)
+            reading.temperature = Double(values.temperature)
+            reading.tint = Double(values.tint)
+        }
+        return reading
     }
 
     func clearFailure() {
@@ -732,6 +1029,24 @@ final class CameraService {
 
 // MARK: - Capture delegate
 
+/// Reads live lens and white-balance state while frames arrive, off the main actor.
+/// Read-only access to KVO-backed device properties.
+nonisolated final class DeviceProbe: @unchecked Sendable {
+    private let device: AVCaptureDevice
+
+    init(_ device: AVCaptureDevice) {
+        self.device = device
+    }
+
+    var lensPosition: Double? {
+        device.isFocusModeSupported(.autoFocus) ? Double(device.lensPosition) : nil
+    }
+
+    func whiteBalance() -> WhiteBalanceReading? {
+        CameraService.whiteBalanceReading(device)
+    }
+}
+
 /// Sendable description of the camera at the moment of capture, handed to the delegate so each
 /// frame it writes is fully described without touching the main actor.
 private struct SequenceContext: Sendable {
@@ -739,14 +1054,15 @@ private struct SequenceContext: Sendable {
     var orientation: CaptureOrientation
     var cameraID: String
     var lensType: String
-    var lensPosition: Double?
     var isBracket: Bool
+    var probe: DeviceProbe
 }
 
 private struct SegmentOutcome: Sendable {
     var frames: [CaptureFrame] = []
     var persistSeconds: Double = 0
     var firstPhotoAt: Date?
+    var lastPhotoAt: Date?
     /// Normalised failure. Frames already written are still reported, as evidence.
     var failure: CameraError?
 }
@@ -784,7 +1100,7 @@ private final class CaptureResumeGate: @unchecked Sendable {
 /// immediately afterwards, so a nine-frame bracket never accumulates in memory. The requested EV
 /// is taken from the bracket settings AVFoundation hands back, never from callback order alone.
 private nonisolated final class SequenceCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
-    private let requestedEVs: [Int]
+    private let requestedEVs: [Double]
     private let baseIndex: Int
     private let context: SequenceContext
     private let completion: @Sendable (SegmentOutcome) -> Void
@@ -794,7 +1110,7 @@ private nonisolated final class SequenceCaptureDelegate: NSObject, AVCapturePhot
     private var hasFinished = false
 
     init(
-        requestedEVs: [Int],
+        requestedEVs: [Double],
         baseIndex: Int,
         context: SequenceContext,
         completion: @escaping @Sendable (SegmentOutcome) -> Void
@@ -821,18 +1137,26 @@ private nonisolated final class SequenceCaptureDelegate: NSObject, AVCapturePhot
             return
         }
 
-        if outcome.firstPhotoAt == nil { outcome.firstPhotoAt = Date() }
+        let arrivedAt = Date()
+        if outcome.firstPhotoAt == nil { outcome.firstPhotoAt = arrivedAt }
+        outcome.lastPhotoAt = arrivedAt
+
+        // Lens and colour state are sampled the moment each exposure arrives, so a focus or white
+        // balance drift between frames is measurable afterwards.
+        let lensPosition = context.probe.lensPosition
+        let whiteBalance = context.probe.whiteBalance()
 
         // Position in the ladder comes from the settings AVFoundation echoes back, so the bracket
         // can be reconstructed deterministically even if callbacks arrive out of order.
         let bracketBias = (photo.bracketSettings as? AVCaptureAutoExposureBracketedStillImageSettings)?
             .exposureTargetBias
         let fallbackEV = requestedEVs[min(received, max(0, requestedEVs.count - 1))]
-        let requestedEV = bracketBias.map { Double($0) } ?? Double(fallbackEV)
-        let ladderPosition = requestedEVs.firstIndex { abs(Double($0) - requestedEV) < 0.01 } ?? received
+        let requestedEV = bracketBias.map { Double($0) } ?? fallbackEV
+        let ladderPosition = requestedEVs.firstIndex { abs($0 - requestedEV) < 0.01 } ?? received
         let sequenceIndex = baseIndex + ladderPosition
 
         let metadata = Self.exposureMetadata(photo)
+        let timestamp = CMTimeGetSeconds(photo.timestamp)
         let writeStartedAt = Date()
         do {
             var frame = try CaptureBundleStore.writeFrame(
@@ -842,13 +1166,17 @@ private nonisolated final class SequenceCaptureDelegate: NSObject, AVCapturePhot
                 requestedEV: requestedEV,
                 orientation: context.orientation,
                 cameraID: context.cameraID,
-                lensType: context.lensType
+                lensType: context.lensType,
+                capturedAt: arrivedAt
             )
             frame.actualExposureBias = metadata.bias
             frame.exposureDurationSeconds = metadata.exposureDuration
             frame.iso = metadata.iso
             frame.aperture = metadata.aperture
-            frame.lensPosition = context.lensPosition
+            frame.focalLengthMM = metadata.focalLength
+            frame.lensPosition = lensPosition
+            frame.whiteBalance = whiteBalance
+            frame.sensorTimestampSeconds = timestamp.isFinite && timestamp > 0 ? timestamp : nil
             frame.metadata = metadata.extras
             outcome.frames.append(frame)
         } catch {
@@ -875,25 +1203,33 @@ private nonisolated final class SequenceCaptureDelegate: NSObject, AVCapturePhot
     /// Reads what the camera actually did, rather than what was asked of it.
     private static func exposureMetadata(
         _ photo: AVCapturePhoto
-    ) -> (bias: Double?, exposureDuration: Double?, iso: Double?, aperture: Double?, extras: [String: String]) {
+    ) -> (
+        bias: Double?,
+        exposureDuration: Double?,
+        iso: Double?,
+        aperture: Double?,
+        focalLength: Double?,
+        extras: [String: String]
+    ) {
         let exif = photo.metadata[kCGImagePropertyExifDictionary as String] as? [String: Any]
         let bias = exif?[kCGImagePropertyExifExposureBiasValue as String] as? Double
         let duration = exif?[kCGImagePropertyExifExposureTime as String] as? Double
         let iso = (exif?[kCGImagePropertyExifISOSpeedRatings as String] as? [Double])?.first
         let aperture = exif?[kCGImagePropertyExifFNumber as String] as? Double
+        let focalLength = exif?[kCGImagePropertyExifFocalLength as String] as? Double
 
         var extras: [String: String] = [:]
         if let lensModel = exif?[kCGImagePropertyExifLensModel as String] as? String {
             extras["lensModel"] = lensModel
         }
-        if let focalLength = exif?[kCGImagePropertyExifFocalLenIn35mmFilm as String] as? Double {
-            extras["focalLength35mm"] = String(Int(focalLength))
+        if let focalLength35 = exif?[kCGImagePropertyExifFocalLenIn35mmFilm as String] as? Double {
+            extras["focalLength35mm"] = String(Int(focalLength35))
         }
         if let brightness = exif?[kCGImagePropertyExifBrightnessValue as String] as? Double {
             extras["brightnessValue"] = String(format: "%.3f", brightness)
         }
         extras["photoCount"] = String(photo.photoCount)
         extras["sequenceCount"] = String(photo.sequenceCount)
-        return (bias, duration, iso, aperture, extras)
+        return (bias, duration, iso, aperture, focalLength, extras)
     }
 }

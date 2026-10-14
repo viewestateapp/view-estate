@@ -49,6 +49,14 @@ struct CaptureFrame: Codable, Hashable, Sendable, Identifiable {
     var uploadState: FrameUploadState = .pendingUpload
     var metadata: [String: String] = [:]
 
+    // Phase D3 — optional so manifests written by earlier builds still decode.
+
+    /// Sensor timestamp of the exposure, seconds on the capture clock.
+    var sensorTimestampSeconds: Double?
+    /// White balance the device reported when this exposure was delivered.
+    var whiteBalance: WhiteBalanceReading?
+    var focalLengthMM: Double?
+
     /// The reference frame every future alignment step starts from.
     var isReferenceExposure: Bool { abs(requestedEV) < 0.01 }
 
@@ -131,7 +139,10 @@ enum HDRSource: String, Codable, Hashable, Sendable {
 /// Written next to the frames themselves, so a capture survives an app restart, needs no
 /// connectivity and can be validated without any other source of truth.
 struct CaptureManifest: Codable, Hashable, Sendable, Identifiable {
-    static let currentSchemaVersion = 1
+    /// v2 adds the Phase D3 quality report, floating-point ladders and QA tags.
+    static let currentSchemaVersion = 2
+    /// v1 bundles written before D3 remain valid captures.
+    static let supportedSchemaVersions: ClosedRange<Int> = 1...2
 
     var schemaVersion: Int = CaptureManifest.currentSchemaVersion
 
@@ -178,7 +189,30 @@ struct CaptureManifest: Codable, Hashable, Sendable, Identifiable {
 
     var frames: [CaptureFrame]
 
+    // Phase D3
+
+    /// The exact ladder requested. `nil` on v1 manifests, which always used the profile ladder.
+    var requestedExposureValues: [Double]? = nil
+    var quality: CaptureQualityReport? = nil
+    /// Present only on development QA captures; untagged bundles are never exported.
+    var qaTag: CameraQATag? = nil
+
     var id: UUID { clientCaptureID }
+
+    var requestedLadder: [Double] { requestedExposureValues ?? captureProfile.exposureValues }
+
+    /// Time between consecutive frames, from sensor timestamps when every frame has one.
+    var frameIntervalsMs: [Double] {
+        let ordered = orderedFrames
+        guard ordered.count > 1 else { return [] }
+        let stamps: [Double]
+        if ordered.allSatisfy({ $0.sensorTimestampSeconds != nil }) {
+            stamps = ordered.compactMap(\.sensorTimestampSeconds)
+        } else {
+            stamps = ordered.map { $0.capturedAt.timeIntervalSinceReferenceDate }
+        }
+        return zip(stamps.dropFirst(), stamps).map { ($0 - $1) * 1000 }
+    }
 
     var totalByteCount: Int { frames.reduce(0) { $0 + $1.byteCount } }
 

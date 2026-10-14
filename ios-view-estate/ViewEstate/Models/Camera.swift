@@ -55,6 +55,8 @@ enum CameraError: String, Error, Sendable, CaseIterable {
     case captureInterrupted = "CAPTURE_INTERRUPTED"
     case ev0Missing = "EV0_MISSING"
     case manifestInvalid = "MANIFEST_INVALID"
+    case focusTimeout = "FOCUS_TIMEOUT"
+    case insufficientStorage = "INSUFFICIENT_STORAGE"
 
     /// Stable code for logs and the developer panel.
     var code: String { rawValue }
@@ -68,6 +70,8 @@ enum CameraError: String, Error, Sendable, CaseIterable {
         case .initializationFailed: "camera.error.init"
         case .captureFailed: "camera.error.capture"
         case .localSaveFailed: "camera.error.save"
+        case .focusTimeout: "camera.error.focus"
+        case .insufficientStorage: "camera.error.storage"
         default: "camera.error.bracket"
         }
     }
@@ -187,6 +191,15 @@ struct CameraDiagnostics: Sendable {
     var lastManifest: CaptureManifest?
     var lastCaptureSeconds: Double?
     var lastErrorCode: String?
+    /// Calibration profile resolved for this device.
+    var calibration: CameraCalibrationProfile = .generic
+    /// Every shutter action of this app session — repeated-capture and stress diagnostics.
+    var sessionRuns: [CaptureRunMetric] = []
+
+    /// Shutter actions that reused an attempt id. Must always be zero.
+    var duplicateAttemptCount: Int {
+        sessionRuns.count - Set(sessionRuns.map(\.clientCaptureID)).count
+    }
 
     /// Real pixels, simulated master. The two are never confused internally.
     var captureSource: CaptureSource { mode.isNative ? .nativeReal : .simulated }

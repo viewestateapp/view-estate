@@ -10,5 +10,5 @@
 import Foundation
 
 enum Config {
-    static let allValues: [String: String] = [:]
+    nonisolated static let allValues: [String: String] = [:]
 }

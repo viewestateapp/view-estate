@@ -20,7 +20,8 @@ enum CaptureManifestBuilder {
         result: BracketCaptureResult,
         attempt: CaptureAttempt,
         property: Property,
-        organizationID: String
+        organizationID: String,
+        context: CaptureRecordingContext = .none
     ) throws -> CaptureManifest {
         let startedAt = Date()
         var manifest = manifest(
@@ -28,7 +29,8 @@ enum CaptureManifestBuilder {
             attempt: attempt,
             property: property,
             organizationID: organizationID,
-            state: .localValidating
+            state: .localValidating,
+            context: context
         )
 
         // The manifest lands on disk before validation, so an interrupted app still leaves a
@@ -50,7 +52,8 @@ enum CaptureManifestBuilder {
         try CaptureBundleStore.writeManifest(manifest)
         VELog.camera(
             "manifest ready profile=\(manifest.captureProfile.devLabel) "
-                + "frames=\(manifest.frameCountDescription) size=\(manifest.totalSizeDescription)"
+                + "frames=\(manifest.frameCountDescription) size=\(manifest.totalSizeDescription) "
+                + "quality=\(manifest.quality?.qualityClass.devLabel ?? "—")"
         )
         return manifest
     }
@@ -61,14 +64,16 @@ enum CaptureManifestBuilder {
         _ failure: BracketCaptureFailure,
         attempt: CaptureAttempt,
         property: Property,
-        organizationID: String
+        organizationID: String,
+        context: CaptureRecordingContext = .none
     ) -> CaptureManifest {
         var manifest = manifest(
             result: failure.partial,
             attempt: attempt,
             property: property,
             organizationID: organizationID,
-            state: failure.code.bundleState
+            state: failure.code.bundleState,
+            context: context
         )
         manifest.failureCode = failure.code.code
         manifest.completedAt = Date()
@@ -85,9 +90,26 @@ enum CaptureManifestBuilder {
         attempt: CaptureAttempt,
         property: Property,
         organizationID: String,
-        state: CaptureBundleState
+        state: CaptureBundleState,
+        context: CaptureRecordingContext
     ) -> CaptureManifest {
-        CaptureManifest(
+        let quality = CaptureQualityAnalyzer.report(
+            CaptureQualityInput(
+                frames: result.frames,
+                motion: context.motion,
+                preparation: result.preparation,
+                calibration: result.calibration,
+                requestedExposureValues: result.plan.exposureValues,
+                ladderSource: result.plan.ladderSource,
+                lens: result.lens,
+                tapToCaptureStartMs: result.tapToCaptureStartMs,
+                bracketDurationMs: result.bracketDurationMs,
+                capturedOffline: context.capturedOffline,
+                thermalState: DeviceHealthProbe.thermalStateLabel(),
+                memoryFootprintMB: DeviceHealthProbe.memoryFootprintMB()
+            )
+        )
+        return CaptureManifest(
             captureID: nil,
             clientCaptureID: attempt.id,
             organizationID: organizationID,
@@ -111,7 +133,19 @@ enum CaptureManifestBuilder {
             firstFrameSeconds: result.firstFrameSeconds,
             bracketSeconds: result.bracketSeconds,
             persistSeconds: result.persistSeconds,
-            frames: result.frames.sorted { $0.sequenceIndex < $1.sequenceIndex }
+            frames: result.frames.sorted { $0.sequenceIndex < $1.sequenceIndex },
+            requestedExposureValues: result.plan.exposureValues,
+            quality: quality,
+            qaTag: context.qaTag
         )
     }
+}
+
+/// What the capture flow knows about a shutter action beyond the camera hardware.
+struct CaptureRecordingContext: Sendable {
+    var motion: CaptureMotionSnapshot
+    var capturedOffline: Bool
+    var qaTag: CameraQATag?
+
+    static let none = CaptureRecordingContext(motion: .unavailable, capturedOffline: false, qaTag: nil)
 }

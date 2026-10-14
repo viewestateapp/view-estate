@@ -114,6 +114,13 @@ struct DevPanelView: View {
                     if let code = diagnostics.lastErrorCode {
                         debugRow("Last error", code)
                     }
+                    NavigationLink {
+                        CameraLabView()
+                    } label: {
+                        Text("Camera Lab · calibration & QA")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(VE.copper)
+                    }
                 }
                 .listRowBackground(VE.surface)
 
@@ -136,7 +143,7 @@ struct DevPanelView: View {
                     }
                     if let plan = diagnostics.plan {
                         debugRow("Selected Capture Profile", plan.profile.devLabel)
-                        debugRow("Ladder", plan.exposureValues.map(String.init).joined(separator: " "))
+                        debugRow("Ladder", plan.ladderDescription)
                         debugRow("Bracket requests", plan.segmentDescription)
                         Text(plan.reason)
                             .font(.system(size: 12))

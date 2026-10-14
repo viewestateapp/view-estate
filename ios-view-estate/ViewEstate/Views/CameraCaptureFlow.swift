@@ -112,19 +112,32 @@ struct CameraPrototypeView: View {
     @Environment(\.scenePhase) private var scenePhase
 
     @State private var camera = CameraService()
+    /// Real device motion: drives the stability chip, the level line and the shutter policy.
+    @State private var stability = CameraStabilityService()
     @State private var isCapturing = false
-    @State private var activeFrame: Int?
-    @State private var isStable = true
-    @State private var levelOffset: CGFloat = 0
+    @State private var activeFrame: Double?
     @State private var shutterPulse = false
     @State private var errorMessage: String?
 
     /// The prototype always shows the full ladder; profiles are a real-camera concern.
-    private let simulatedExposures: [Int] = CaptureProfile.full9.exposureValues
+    private let simulatedExposures: [Double] = CaptureProfile.full9.exposureValues
 
     /// In native mode the ladder is whatever this device can genuinely photograph.
-    private var exposures: [Int] {
+    private var exposures: [Double] {
         isNative ? camera.plan.exposureValues : simulatedExposures
+    }
+
+    private var stabilityState: StabilityState { stability.displayState }
+    private var isStable: Bool { stabilityState == .stable }
+
+    /// Horizon tilt shown by the level line, kept subtle.
+    private var levelAngle: Double {
+        guard stability.isSensorAvailable else { return 0 }
+        return min(20, max(-20, stability.reading.rollDegrees))
+    }
+
+    private var isLevel: Bool {
+        !stability.isSensorAvailable || stability.reading.isLevel
     }
 
     private var isNative: Bool {
@@ -139,7 +152,7 @@ struct CameraPrototypeView: View {
             controls
         }
         .background(VE.overlay.ignoresSafeArea())
-        .task { await driftLevel() }
+        .onAppear { stability.start() }
         .task {
             guard previewCapturing else { return }
             while !Task.isCancelled {
@@ -148,23 +161,20 @@ struct CameraPrototypeView: View {
         }
         .task(id: isNative) {
             guard isNative else { return }
-            await camera.start()
-            state.cameraDiagnostics.mode = state.cameraMode
-            state.cameraDiagnostics.access = camera.access
-            state.cameraDiagnostics.setup = camera.setup
-            state.cameraDiagnostics.capabilities = camera.capabilities
-            state.cameraDiagnostics.plan = camera.plan
+            await startCamera()
             if let failure = camera.failure, failure != .permissionDenied {
                 errorMessage = state.t(failure.localizationKey)
                 state.cameraDiagnostics.lastErrorCode = failure.code
             }
         }
         .onChange(of: scenePhase) { _, phase in
-            guard isNative else { return }
             switch phase {
             case .active:
-                Task { await camera.start() }
+                stability.start()
+                if isNative { Task { await startCamera() } }
             case .background, .inactive:
+                stability.stop()
+                guard isNative else { return }
                 // A sequence that loses the foreground can never be completed as a success.
                 camera.markInterrupted()
                 camera.stop()
@@ -172,7 +182,10 @@ struct CameraPrototypeView: View {
                 break
             }
         }
-        .onDisappear { camera.stop() }
+        .onDisappear {
+            camera.stop()
+            stability.stop()
+        }
     }
 
     // MARK: - Context
@@ -210,10 +223,11 @@ struct CameraPrototypeView: View {
                 statusChip(text: state.t("camera.offline"), tint: VE.warning, filled: false)
             } else {
                 statusChip(
-                    text: isStable ? state.t("camera.stable") : state.t("camera.stabilizing"),
+                    text: state.t(stabilityState.localizationKey),
                     tint: isStable ? VE.textSecondary : VE.warning,
                     filled: false
                 )
+                .animation(.easeOut(duration: 0.2), value: stabilityState)
             }
         }
         .padding(.horizontal, VE.Space.m)
@@ -325,7 +339,7 @@ struct CameraPrototypeView: View {
             ForEach(exposures, id: \.self) { value in
                 let active = activeFrame == value
                 VStack(spacing: 3) {
-                    Text(value > 0 ? "+\(value)" : "\(value)")
+                    Text(CaptureProfile.evLabel(value))
                         .font(VE.Font.mono)
                         .foregroundStyle(active ? VE.copper : (value == 0 ? VE.textSecondary : VE.textTertiary))
                     Rectangle()
@@ -364,18 +378,22 @@ struct CameraPrototypeView: View {
         .allowsHitTesting(false)
     }
 
+    /// Real horizon line: counter-rotates against the phone's roll, so it stays parallel to the
+    /// true horizon. Within the calibrated tolerance it reads as ready; outside it, it guides.
+    /// The source image is never rotated.
     private func levelIndicator(width: CGFloat) -> some View {
         Rectangle()
-            .fill(isStable ? VE.textPrimary.opacity(0.9) : VE.warning)
+            .fill(isLevel ? VE.textPrimary.opacity(0.9) : VE.warning)
             .frame(width: width * 0.55, height: 1.5)
-            .rotationEffect(.degrees(levelOffset))
-            .animation(.easeInOut(duration: 0.8), value: levelOffset)
+            .rotationEffect(.degrees(-levelAngle))
+            .animation(.easeOut(duration: 0.12), value: levelAngle)
+            .animation(.easeOut(duration: 0.2), value: isLevel)
             .allowsHitTesting(false)
     }
 
     private var frameBrightness: Double {
         guard let frame = activeFrame else { return 0.62 }
-        return min(1.0, max(0.12, 0.62 + Double(frame) * 0.11))
+        return min(1.0, max(0.12, 0.62 + frame * 0.11))
     }
 
     // MARK: - Rooms
@@ -419,8 +437,10 @@ struct CameraPrototypeView: View {
         isNative ? camera.isRunning : true
     }
 
+    /// CAMERA_READY plus the shutter policy: ordinary instability only warns; severe movement
+    /// holds the shutter when the calibration says so.
     private var canCapture: Bool {
-        guard !isCapturing else { return false }
+        guard !isCapturing, stability.allowsCapture else { return false }
         return isNative ? camera.isRunning : true
     }
 
@@ -514,7 +534,7 @@ struct CameraPrototypeView: View {
                     .strokeBorder(VE.overlay.opacity(0.55), lineWidth: 3)
                     .frame(width: 62, height: 62)
                 if isCapturing, let frame = activeFrame {
-                    Text(frame > 0 ? "+\(frame)" : "\(frame)")
+                    Text(CaptureProfile.evLabel(frame))
                         .font(.system(size: 20, weight: .bold, design: .monospaced))
                         .foregroundStyle(Color(hex: 0x1B1410))
                 }
@@ -547,27 +567,56 @@ struct CameraPrototypeView: View {
             errorMessage = state.t("camera.permission.body")
             return
         }
+        let tapAt = Date()
         guard let attempt = state.beginCaptureAttempt(property: property, room: room) else { return }
 
         isCapturing = true
         errorMessage = nil
+        // Roll, pitch and the "before" stability are frozen at the tap.
+        stability.beginCaptureWindow()
         let feedback = Task { await sweepLadder() }
         defer { feedback.cancel() }
 
+        let result: BracketCaptureResult
         do {
-            let result = try await camera.captureBracket(clientCaptureID: attempt.id)
+            result = try await camera.captureBracket(
+                clientCaptureID: attempt.id,
+                tapAt: tapAt,
+                availableBytesOverride: state.devAvailableBytesOverride
+            )
+        } catch {
+            let context = recordingContext(motion: stability.endCaptureWindow())
+            guard let failure = error as? BracketCaptureFailure else {
+                report((error as? CameraError) ?? .bracketCaptureFailed, attempt: attempt, manifest: nil)
+                return
+            }
+            // Whatever reached the device is kept as an incomplete attempt — never as a capture.
+            let manifest = CaptureManifestBuilder.recordFailure(
+                failure,
+                attempt: attempt,
+                property: property,
+                organizationID: state.organizationName,
+                context: context
+            )
+            report(failure.code, attempt: attempt, manifest: manifest)
+            return
+        }
+
+        let context = recordingContext(motion: stability.endCaptureWindow())
+        do {
             state.beginLocalValidation()
             let manifest = try CaptureManifestBuilder.finalize(
                 result: result,
                 attempt: attempt,
                 property: property,
-                organizationID: state.organizationName
+                organizationID: state.organizationName,
+                context: context
             )
             state.cameraDiagnostics.lastCaptureSeconds = result.bracketSeconds
             state.cameraDiagnostics.lastManifest = manifest
-            state.cameraDiagnostics.plan = camera.plan
-            state.cameraDiagnostics.capabilities = camera.capabilities
             state.cameraDiagnostics.lastErrorCode = nil
+            syncDiagnostics()
+            recordRun(attempt: attempt, manifest: manifest, failure: nil)
             finishCapturing()
             onCaptured(
                 attempt,
@@ -577,26 +626,57 @@ struct CameraPrototypeView: View {
                     manifest: manifest
                 )
             )
-        } catch let failure as BracketCaptureFailure {
-            // Whatever reached the device is kept as an incomplete attempt — never as a capture.
-            let manifest = CaptureManifestBuilder.recordFailure(
-                failure,
-                attempt: attempt,
-                property: property,
-                organizationID: state.organizationName
-            )
-            report(failure.code, manifest: manifest)
         } catch {
             let code = (error as? CameraError) ?? .bracketCaptureFailed
-            report(code, manifest: CaptureBundleStore.readManifest(clientCaptureID: attempt.id))
+            report(code, attempt: attempt, manifest: CaptureBundleStore.readManifest(clientCaptureID: attempt.id))
         }
     }
 
-    private func report(_ code: CameraError, manifest: CaptureManifest?) {
+    private func recordingContext(motion: CaptureMotionSnapshot) -> CaptureRecordingContext {
+        CaptureRecordingContext(motion: motion, capturedOffline: !state.isOnline, qaTag: state.qaTag)
+    }
+
+    private func report(_ code: CameraError, attempt: CaptureAttempt, manifest: CaptureManifest?) {
         state.cameraDiagnostics.lastErrorCode = code.code
         state.cameraDiagnostics.lastManifest = manifest
+        syncDiagnostics()
+        recordRun(attempt: attempt, manifest: manifest, failure: code)
         errorMessage = state.t(code.localizationKey)
         finishCapturing()
+    }
+
+    private func recordRun(attempt: CaptureAttempt, manifest: CaptureManifest?, failure: CameraError?) {
+        state.recordCaptureRun(
+            CaptureRunMetric(
+                clientCaptureID: attempt.id,
+                at: .now,
+                succeeded: failure == nil,
+                frameCount: manifest?.actualFrameCount ?? 0,
+                bracketDurationMs: manifest?.quality?.bracketDurationMs,
+                tapToCaptureStartMs: manifest?.quality?.tapToCaptureStartMs,
+                memoryFootprintMB: DeviceHealthProbe.memoryFootprintMB(),
+                thermalState: DeviceHealthProbe.thermalStateLabel(),
+                qualityClass: manifest?.quality?.qualityClass,
+                failureCode: failure?.code
+            )
+        )
+    }
+
+    /// Starts the real camera with the calibration-preferred lens (or the developer lens test)
+    /// and hands the resolved calibration to the stability analysis.
+    private func startCamera() async {
+        await camera.start(lensOverride: state.devLensOverride)
+        stability.apply(camera.calibration)
+        syncDiagnostics()
+    }
+
+    private func syncDiagnostics() {
+        state.cameraDiagnostics.mode = state.cameraMode
+        state.cameraDiagnostics.access = camera.access
+        state.cameraDiagnostics.setup = camera.setup
+        state.cameraDiagnostics.capabilities = camera.capabilities
+        state.cameraDiagnostics.plan = camera.plan
+        state.cameraDiagnostics.calibration = camera.calibration
     }
 
     /// The approved simulation: one tap runs the whole nine-exposure sequence.
@@ -639,14 +719,5 @@ struct CameraPrototypeView: View {
 
         withAnimation(.easeOut(duration: 0.2)) { activeFrame = nil }
         shutterPulse = false
-    }
-
-    private func driftLevel() async {
-        while !Task.isCancelled {
-            try? await Task.sleep(for: .milliseconds(1600))
-            let drift = Double.random(in: -1.2...1.2)
-            levelOffset = drift
-            isStable = abs(drift) < 0.8
-        }
     }
 }

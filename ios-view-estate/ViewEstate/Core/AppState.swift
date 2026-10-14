@@ -113,6 +113,29 @@ final class AppState {
     /// True while a finished bracket is being checked against its manifest.
     private(set) var isValidatingCapture: Bool = false
 
+    // MARK: - Camera Lab (development only)
+
+    /// Tags the next captures as part of the physical QA dataset. `nil` = normal capture.
+    var qaTag: CameraQATag?
+    /// Lens used when the camera next opens — the separate ultra-wide test. `nil` = calibration.
+    var devLensOverride: PreferredLens?
+    /// Makes the storage preflight see an almost full device.
+    var devSimulateLowStorage: Bool = false
+
+    /// Bytes the low-storage simulation reports as free.
+    var devAvailableBytesOverride: Int64? { devSimulateLowStorage ? 50_000_000 : nil }
+
+    /// True while a shutter action owns the camera. Background sync yields to it.
+    var isCapturing: Bool { captureSessionState == .capturing }
+
+    /// Records one shutter action for the repeated-capture and stress diagnostics.
+    func recordCaptureRun(_ run: CaptureRunMetric) {
+        cameraDiagnostics.sessionRuns.append(run)
+        if cameraDiagnostics.sessionRuns.count > 200 {
+            cameraDiagnostics.sessionRuns.removeFirst(cameraDiagnostics.sessionRuns.count - 200)
+        }
+    }
+
     /// READY → CAPTURING → LOCAL_VALIDATING → LOCAL_READY, as reported in the developer panel.
     var captureStageLabel: String {
         if captureSessionState == .capturing {
@@ -354,8 +377,9 @@ final class AppState {
 
             try? await Task.sleep(for: .seconds(self.preparationSeconds))
 
-            // Offline captures wait for connectivity, but the user is never blocked.
-            while !self.isOnline && !Task.isCancelled {
+            // Offline captures wait for connectivity, but the user is never blocked. Sync also
+            // yields while a new bracket is being photographed: the camera always has priority.
+            while (!self.isOnline || self.isCapturing) && !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(400))
             }
             guard !Task.isCancelled else { return }
@@ -517,6 +541,9 @@ final class AppState {
         lastAttemptID = nil
         isValidatingCapture = false
         cameraDiagnostics = CameraDiagnostics(mode: cameraMode)
+        qaTag = nil
+        devLensOverride = nil
+        devSimulateLowStorage = false
         isOnline = true
         syncState = .synced
     }
