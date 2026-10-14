@@ -97,9 +97,12 @@ struct CaptureOutcome: Sendable {
 
 /// The professional capture tool.
 ///
-/// The interface is the approved one in both modes. With `camera_native_enabled` OFF the
-/// viewfinder is a faithful UI simulation; with it ON the real rear camera runs behind exactly
-/// the same interface and one shutter tap photographs a real multi-exposure bracket.
+/// An immersive, photography-first viewfinder: a full-width 4:3 live preview carrying only quiet
+/// photographic guides, a hairline top bar with the property and room, and every control gathered
+/// below the image around one dominant shutter. With `camera_native_enabled` OFF the viewfinder is
+/// a faithful UI simulation; with it ON the real rear camera runs behind exactly the same interface
+/// and one shutter tap photographs a real multi-exposure bracket. The exposure sequence is never
+/// surfaced — no EV ladder, no frame counter.
 struct CameraPrototypeView: View {
     let property: Property
     @Binding var room: RoomType
@@ -112,14 +115,18 @@ struct CameraPrototypeView: View {
     @Environment(\.scenePhase) private var scenePhase
 
     @State private var camera = CameraService()
-    /// Real device motion: drives the stability chip, the level line and the shutter policy.
+    /// Real device motion: drives the stability indicator, the level guide and the shutter policy.
     @State private var stability = CameraStabilityService()
     @State private var isCapturing = false
     @State private var activeFrame: Double?
     @State private var shutterPulse = false
     @State private var errorMessage: String?
+    @State private var showRoomPicker = false
+    @State private var showGallery = false
+    @AppStorage("ve.camera.grid") private var showsGrid: Bool = true
+    @AppStorage("ve.camera.level") private var showsLevel: Bool = true
 
-    /// The prototype always shows the full ladder; profiles are a real-camera concern.
+    /// The prototype always runs the full ladder internally; profiles are a real-camera concern.
     private let simulatedExposures: [Double] = CaptureProfile.full9.exposureValues
 
     /// In native mode the ladder is whatever this device can genuinely photograph.
@@ -130,7 +137,7 @@ struct CameraPrototypeView: View {
     private var stabilityState: StabilityState { stability.displayState }
     private var isStable: Bool { stabilityState == .stable }
 
-    /// Horizon tilt shown by the level line, kept subtle.
+    /// Horizon tilt shown by the level guide, kept subtle.
     private var levelAngle: Double {
         guard stability.isSensorAvailable else { return 0 }
         return min(20, max(-20, stability.reading.rollDegrees))
@@ -144,14 +151,36 @@ struct CameraPrototypeView: View {
         state.cameraMode.isNative && !previewCapturing
     }
 
+    /// The session itself is unavailable — the only time a camera-open error may appear.
+    private var isOpenFailure: Bool {
+        guard isNative, !camera.isRunning, let failure = camera.failure else { return false }
+        return failure != .permissionDenied
+    }
+
     var body: some View {
-        VStack(spacing: 0) {
-            contextBar
-            viewfinder
-            roomChips
-            controls
+        GeometryReader { geometry in
+            let controlsMinHeight: CGFloat = 178
+            let fullHeight = geometry.size.width * 4 / 3
+            let previewHeight = max(0, min(fullHeight, geometry.size.height - controlsMinHeight))
+            let previewWidth = previewHeight < fullHeight ? previewHeight * 3 / 4 : geometry.size.width
+
+            VStack(spacing: 0) {
+                viewfinder
+                    .frame(width: previewWidth, height: previewHeight)
+                    .frame(maxWidth: .infinity)
+                bottomControls
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
         }
         .background(VE.overlay.ignoresSafeArea())
+        .statusBarHidden(false)
+        .sensoryFeedback(.impact(weight: .medium), trigger: isCapturing) { _, capturing in capturing }
+        .sensoryFeedback(.selection, trigger: room)
+        .sheet(isPresented: $showRoomPicker) { roomPickerSheet }
+        .sheet(isPresented: $showGallery) {
+            GalleryView()
+                .preferredColorScheme(.dark)
+        }
         .onAppear { stability.start() }
         .task {
             guard previewCapturing else { return }
@@ -163,9 +192,15 @@ struct CameraPrototypeView: View {
             guard isNative else { return }
             await startCamera()
             if let failure = camera.failure, failure != .permissionDenied {
-                errorMessage = state.t(failure.localizationKey)
                 state.cameraDiagnostics.lastErrorCode = failure.code
             }
+        }
+        .task(id: errorMessage) {
+            // Capture messages are transient: they fade on their own.
+            guard errorMessage != nil else { return }
+            try? await Task.sleep(for: .seconds(5))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.25)) { errorMessage = nil }
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
@@ -188,93 +223,116 @@ struct CameraPrototypeView: View {
         }
     }
 
-    // MARK: - Context
+    // MARK: - Top bar
 
-    private var contextBar: some View {
-        HStack(spacing: 12) {
+    private var topBar: some View {
+        HStack(alignment: .center, spacing: 12) {
             Button {
                 onClose()
             } label: {
                 Image(systemName: "xmark")
-                    .font(.system(size: 14, weight: .semibold))
+                    .font(.system(size: 13, weight: .semibold))
                     .foregroundStyle(VE.textPrimary)
-                    .frame(width: 36, height: 36)
-                    .background(VE.surface, in: .circle)
+                    .frame(width: 32, height: 32)
+                    .background(.black.opacity(0.35), in: .circle)
+                    .frame(width: 44, height: 44)
+                    .contentShape(.rect)
             }
+            .buttonStyle(.plain)
             .accessibilityLabel(state.t("common.close"))
 
-            VStack(alignment: .leading, spacing: 1) {
-                Text(property.title)
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(VE.textPrimary)
-                Text(state.roomName(room))
-                    .font(VE.Font.caption)
-                    .foregroundStyle(VE.copper)
+            Button {
+                showRoomPicker = true
+            } label: {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(property.title)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(VE.textPrimary)
+                        .lineLimit(1)
+                    HStack(spacing: 3) {
+                        Text(state.roomName(room))
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(VE.copper)
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundStyle(VE.copper.opacity(0.8))
+                    }
+                }
+                .shadow(color: .black.opacity(0.4), radius: 4, y: 1)
+                .contentShape(.rect)
             }
+            .buttonStyle(.plain)
+            .disabled(isCapturing)
+            .accessibilityLabel("\(property.title), \(state.roomName(room))")
+            .accessibilityHint(state.t("camera.tool.room"))
 
-            Spacer()
+            Spacer(minLength: 8)
 
-            statusChip(
-                text: isCapturing ? state.t("camera.capturing") : state.t("camera.ready"),
-                tint: isCapturing ? VE.copper : (isCameraLive ? VE.success : VE.textSecondary),
-                filled: true
-            )
-            if !state.isOnline {
-                statusChip(text: state.t("camera.offline"), tint: VE.warning, filled: false)
-            } else {
-                statusChip(
-                    text: state.t(stabilityState.localizationKey),
-                    tint: isStable ? VE.textSecondary : VE.warning,
-                    filled: false
-                )
-                .animation(.easeOut(duration: 0.2), value: stabilityState)
-            }
+            statusIndicator
         }
-        .padding(.horizontal, VE.Space.m)
-        .padding(.vertical, VE.Space.s)
+        .padding(.leading, 6)
+        .padding(.trailing, VE.Space.m)
+        .padding(.top, 2)
     }
 
-    private func statusChip(text: String, tint: Color, filled: Bool) -> some View {
-        HStack(spacing: 5) {
-            Circle()
-                .fill(tint)
-                .frame(width: 6, height: 6)
-            Text(text)
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(filled ? VE.textPrimary : tint)
+    /// A dot and a word — never a pill.
+    @ViewBuilder
+    private var statusIndicator: some View {
+        let status: (text: String, tint: Color)? = {
+            if isCapturing { return (state.t("camera.capturing"), VE.copper) }
+            if !state.isOnline { return (state.t("camera.offline"), VE.warning) }
+            guard isCameraLive else { return nil }
+            return (state.t(stabilityState.localizationKey), isStable ? VE.success : VE.warning)
+        }()
+        if let status {
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(status.tint)
+                    .frame(width: 6, height: 6)
+                Text(status.text)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(VE.textPrimary.opacity(0.88))
+            }
+            .shadow(color: .black.opacity(0.45), radius: 4, y: 1)
+            .contentTransition(.opacity)
+            .animation(.easeOut(duration: 0.2), value: status.text)
+            .accessibilityElement(children: .combine)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(VE.surface, in: .capsule)
     }
 
     // MARK: - Viewfinder
 
     private var viewfinder: some View {
-        GeometryReader { geometry in
-            let width = geometry.size.width - VE.Space.m * 2
-            let height = width * 4 / 3
-
-            VStack(spacing: 8) {
-                exposureStrip
-                    .frame(width: width)
-
-                Color.black
-                    .frame(width: width, height: height)
-                    .overlay { viewfinderContent }
-                    .overlay { framingGuides }
-                    .overlay { levelIndicator(width: width) }
-                    .clipShape(.rect(cornerRadius: 4))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 4)
-                            .strokeBorder(isCapturing ? VE.copper.opacity(0.6) : VE.border, lineWidth: 1)
-                    }
-                    .accessibilityLabel("\(state.t("camera.prototype")) 4:3")
+        Color.black
+            .overlay { viewfinderContent }
+            .overlay {
+                if showsGrid, !isOpenFailure { CompositionGrid().allowsHitTesting(false) }
             }
-            .frame(maxWidth: .infinity)
-        }
-        .frame(maxHeight: .infinity)
-        .padding(.horizontal, VE.Space.m)
+            .overlay {
+                if showsLevel, !isOpenFailure, isCameraLive { levelGuide }
+            }
+            .overlay {
+                // A whisper of dimming while the sequence runs — the exposures stay invisible.
+                Color.black
+                    .opacity(isCapturing ? 0.14 : 0)
+                    .animation(.easeOut(duration: 0.18), value: isCapturing)
+                    .allowsHitTesting(false)
+            }
+            .overlay(alignment: .top) {
+                LinearGradient(colors: [.black.opacity(0.55), .clear], startPoint: .top, endPoint: .bottom)
+                    .frame(height: 96)
+                    .allowsHitTesting(false)
+            }
+            .overlay(alignment: .bottom) {
+                LinearGradient(colors: [.clear, .black.opacity(0.4)], startPoint: .top, endPoint: .bottom)
+                    .frame(height: 72)
+                    .allowsHitTesting(false)
+            }
+            .clipped()
+            .overlay(alignment: .top) { topBar }
+            .overlay(alignment: .bottom) { previewFooter }
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel(state.t("camera.prototype"))
     }
 
     /// The live rear camera in native mode, the reference frame in simulated mode, and a
@@ -283,6 +341,8 @@ struct CameraPrototypeView: View {
     private var viewfinderContent: some View {
         if isNative, camera.access.needsSystemSettings {
             permissionState
+        } else if isOpenFailure {
+            openFailureState
         } else if isNative {
             CameraPreview(service: camera)
                 .allowsHitTesting(false)
@@ -296,22 +356,22 @@ struct CameraPrototypeView: View {
             Image(room.placeholderImage)
                 .resizable()
                 .aspectRatio(contentMode: .fill)
-                .opacity(frameBrightness)
+                .opacity(0.9)
                 .allowsHitTesting(false)
         }
     }
 
     private var permissionState: some View {
-        VStack(spacing: VE.Space.m) {
+        VStack(spacing: 14) {
             Image(systemName: "camera.fill")
-                .font(.system(size: 30, weight: .medium))
-                .foregroundStyle(VE.textSecondary)
+                .font(.system(size: 24, weight: .medium))
+                .foregroundStyle(VE.textTertiary)
             VStack(spacing: 6) {
                 Text(state.t("camera.permission.title"))
-                    .font(.system(size: 18, weight: .semibold))
+                    .font(.system(size: 16, weight: .semibold))
                     .foregroundStyle(VE.textPrimary)
                 Text(state.t("camera.permission.body"))
-                    .font(VE.Font.body)
+                    .font(.system(size: 13))
                     .foregroundStyle(VE.textSecondary)
                     .multilineTextAlignment(.center)
             }
@@ -319,116 +379,197 @@ struct CameraPrototypeView: View {
                 camera.openSystemSettings()
             } label: {
                 Text(state.t("camera.permission.cta"))
-                    .font(.system(size: 15, weight: .semibold))
+                    .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(VE.copper)
-                    .padding(.horizontal, VE.Space.m)
-                    .padding(.vertical, 11)
-                    .background {
-                        Capsule().strokeBorder(VE.copper.opacity(0.5), lineWidth: 1)
-                    }
+                    .padding(.horizontal, 16)
+                    .frame(minHeight: 44)
             }
             .buttonStyle(.plain)
             .accessibilityIdentifier("camera.openSettings")
         }
-        .padding(VE.Space.l)
+        .padding(.horizontal, VE.Space.xl)
     }
 
-    /// Advanced, ignorable technical information: a hairline exposure ladder.
-    private var exposureStrip: some View {
-        HStack(spacing: 0) {
-            ForEach(exposures, id: \.self) { value in
-                let active = activeFrame == value
-                VStack(spacing: 3) {
-                    Text(CaptureProfile.evLabel(value))
-                        .font(VE.Font.mono)
-                        .foregroundStyle(active ? VE.copper : (value == 0 ? VE.textSecondary : VE.textTertiary))
-                    Rectangle()
-                        .fill(active ? VE.copper : VE.textTertiary.opacity(0.4))
-                        .frame(width: 1, height: value == 0 ? 8 : 5)
-                }
-                .frame(maxWidth: .infinity)
-                .animation(.easeOut(duration: 0.12), value: activeFrame)
-            }
-
-            Text(exposures.count > 1 ? "HDR · \(exposures.count)" : "FOTO · 1")
-                .font(VE.Font.mono)
+    /// Compact and inline — one line and one action, centred in the black frame.
+    private var openFailureState: some View {
+        VStack(spacing: 10) {
+            Text(state.t("camera.open.failed"))
+                .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(VE.textSecondary)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(VE.surface, in: .capsule)
+                .multilineTextAlignment(.center)
+            Button {
+                Task {
+                    camera.clearFailure()
+                    await startCamera()
+                    if let failure = camera.failure, failure != .permissionDenied {
+                        state.cameraDiagnostics.lastErrorCode = failure.code
+                    }
+                }
+            } label: {
+                Text(state.t("camera.open.retry"))
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(VE.copper)
+                    .padding(.horizontal, 16)
+                    .frame(minHeight: 44)
+            }
+            .buttonStyle(.plain)
         }
+        .padding(.horizontal, VE.Space.xl)
+        .accessibilityIdentifier("camera.error")
+    }
+
+    /// Transient capture message and the lens indicator, resting on the bottom of the image.
+    private var previewFooter: some View {
+        VStack(spacing: 10) {
+            if let errorMessage, !isOpenFailure {
+                captureMessage(errorMessage)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+            if !isOpenFailure, !(isNative && camera.access.needsSystemSettings) {
+                lensIndicator
+            }
+        }
+        .padding(.bottom, 12)
+        .animation(.easeOut(duration: 0.22), value: errorMessage)
+    }
+
+    private func captureMessage(_ message: String) -> some View {
+        Button {
+            withAnimation(.easeOut(duration: 0.2)) { errorMessage = nil }
+        } label: {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(VE.warning)
+                    .frame(width: 6, height: 6)
+                Text(message)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(VE.textPrimary.opacity(0.9))
+                    .multilineTextAlignment(.leading)
+                    .lineLimit(2)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(.black.opacity(0.6), in: .rect(cornerRadius: VE.Radius.chip))
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, VE.Space.l)
+        .accessibilityIdentifier("camera.error")
+    }
+
+    /// Shows the physical lens in use. A second option appears only once a device's ultra-wide
+    /// has been approved through calibration — it is never offered by default.
+    private var lensIndicator: some View {
+        let label = camera.activeLens == .ultraWide && isNative ? "0.5" : "1×"
+        return Text(label)
+            .font(.system(size: 11, weight: .semibold, design: .rounded))
+            .foregroundStyle(VE.copper)
+            .frame(width: 34, height: 34)
+            .background(.black.opacity(0.42), in: .circle)
+            .overlay(Circle().strokeBorder(VE.copper.opacity(0.25), lineWidth: 0.5))
+            .accessibilityLabel("\(state.t("camera.lens")) \(label)")
+    }
+
+    /// Camera-style alignment: fixed reference ticks, a horizon line that counter-rotates
+    /// against the phone's real roll, and a small centre marker. Green when level, amber when
+    /// not. No degrees are ever shown. The source image is never rotated.
+    private var levelGuide: some View {
+        let tint: Color = isLevel ? VE.success : VE.warning
+        return GeometryReader { geometry in
+            let w = geometry.size.width
+            ZStack {
+                HStack(spacing: 0) {
+                    Rectangle().frame(width: 20, height: 1)
+                    Spacer().frame(width: w * 0.34)
+                    Rectangle().frame(width: 20, height: 1)
+                }
+                .foregroundStyle(isLevel ? tint.opacity(0.9) : VE.textPrimary.opacity(0.55))
+
+                Rectangle()
+                    .fill(tint.opacity(isLevel ? 0.9 : 0.95))
+                    .frame(width: w * 0.3, height: 1.2)
+                    .rotationEffect(.degrees(-levelAngle))
+
+                Circle()
+                    .strokeBorder(tint.opacity(0.85), lineWidth: 1)
+                    .frame(width: 9, height: 9)
+                    .background(Circle().fill(.black.opacity(0.15)))
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .shadow(color: .black.opacity(0.35), radius: 2)
+        }
+        .animation(.easeOut(duration: 0.12), value: levelAngle)
+        .animation(.easeOut(duration: 0.2), value: isLevel)
+        .allowsHitTesting(false)
         .accessibilityHidden(true)
     }
 
-    private var framingGuides: some View {
-        GeometryReader { geometry in
-            let w = geometry.size.width
-            let h = geometry.size.height
-            let length: CGFloat = 22
-
-            Path { path in
-                // Corner ticks
-                path.move(to: CGPoint(x: 0, y: length)); path.addLine(to: .zero); path.addLine(to: CGPoint(x: length, y: 0))
-                path.move(to: CGPoint(x: w - length, y: 0)); path.addLine(to: CGPoint(x: w, y: 0)); path.addLine(to: CGPoint(x: w, y: length))
-                path.move(to: CGPoint(x: w, y: h - length)); path.addLine(to: CGPoint(x: w, y: h)); path.addLine(to: CGPoint(x: w - length, y: h))
-                path.move(to: CGPoint(x: length, y: h)); path.addLine(to: CGPoint(x: 0, y: h)); path.addLine(to: CGPoint(x: 0, y: h - length))
-            }
-            .stroke(VE.textPrimary.opacity(0.85), lineWidth: 2)
-        }
-        .allowsHitTesting(false)
-    }
-
-    /// Real horizon line: counter-rotates against the phone's roll, so it stays parallel to the
-    /// true horizon. Within the calibrated tolerance it reads as ready; outside it, it guides.
-    /// The source image is never rotated.
-    private func levelIndicator(width: CGFloat) -> some View {
-        Rectangle()
-            .fill(isLevel ? VE.textPrimary.opacity(0.9) : VE.warning)
-            .frame(width: width * 0.55, height: 1.5)
-            .rotationEffect(.degrees(-levelAngle))
-            .animation(.easeOut(duration: 0.12), value: levelAngle)
-            .animation(.easeOut(duration: 0.2), value: isLevel)
-            .allowsHitTesting(false)
-    }
-
-    private var frameBrightness: Double {
-        guard let frame = activeFrame else { return 0.62 }
-        return min(1.0, max(0.12, 0.62 + frame * 0.11))
-    }
-
-    // MARK: - Rooms
-
-    private var roomChips: some View {
-        ScrollView(.horizontal) {
-            HStack(spacing: 7) {
-                ForEach(availableRooms) { item in
-                    let active = room == item
-                    Button {
-                        withAnimation(.spring(response: 0.25, dampingFraction: 0.85)) { room = item }
-                    } label: {
-                        Text(state.roomName(item))
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(active ? VE.copper : VE.textSecondary)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 7)
-                            .background {
-                                Capsule().fill(active ? VE.copper.opacity(0.16) : VE.surface)
-                                Capsule().strokeBorder(active ? VE.copper.opacity(0.5) : .clear, lineWidth: 1)
-                            }
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(isCapturing)
-                    .accessibilityAddTraits(active ? [.isSelected] : [])
-                }
-            }
-            .padding(.horizontal, VE.Space.m)
-        }
-        .scrollIndicators(.hidden)
-        .padding(.vertical, VE.Space.s)
-    }
+    // MARK: - Rooms & mode
 
     private var availableRooms: [RoomType] {
         property.rooms.isEmpty ? RoomPresets.fallback : property.rooms
+    }
+
+    private var isExteriorMode: Bool { room.isExteriorScene }
+
+    /// Interior / Exterior as a camera mode dial. Switching mode moves to the first room of that
+    /// kind; detailed room switching stays in the top bar and the room button.
+    private var modeSelector: some View {
+        let interior = availableRooms.first { !$0.isExteriorScene }
+        let exterior = availableRooms.first { $0.isExteriorScene }
+        return HStack(spacing: 26) {
+            if let interior {
+                modeLabel(state.t("camera.mode.interior"), active: !isExteriorMode) {
+                    guard isExteriorMode else { return }
+                    room = interior
+                }
+            }
+            if let exterior {
+                modeLabel(state.t("camera.mode.exterior"), active: isExteriorMode) {
+                    guard !isExteriorMode else { return }
+                    room = exterior
+                }
+            }
+        }
+        .disabled(isCapturing)
+        .animation(.spring(response: 0.3, dampingFraction: 0.85), value: isExteriorMode)
+    }
+
+    private func modeLabel(_ title: String, active: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 5) {
+                Text(title.uppercased())
+                    .font(.system(size: 12, weight: .semibold))
+                    .kerning(1.4)
+                    .foregroundStyle(active ? VE.copper : VE.textPrimary.opacity(0.5))
+                Circle()
+                    .fill(VE.copper)
+                    .frame(width: 4, height: 4)
+                    .opacity(active ? 1 : 0)
+            }
+            .frame(minHeight: 32)
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(active ? [.isSelected] : [])
+    }
+
+    private var roomPickerSheet: some View {
+        NavigationStack {
+            RoomPickerContent(property: property, suggested: nil, currentRoom: room) { picked in
+                room = picked
+                showRoomPicker = false
+            }
+            .navigationTitle(state.t("capture.pick.room"))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button(state.t("common.cancel")) { showRoomPicker = false }
+                        .foregroundStyle(VE.textSecondary)
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+        .preferredColorScheme(.dark)
     }
 
     // MARK: - Controls
@@ -444,103 +585,140 @@ struct CameraPrototypeView: View {
         return isNative ? camera.isRunning : true
     }
 
-    private var controls: some View {
-        VStack(spacing: VE.Space.s) {
-            if let errorMessage {
-                errorBanner(errorMessage)
-            }
-            controlRow
+    private var bottomControls: some View {
+        VStack(spacing: 0) {
+            Spacer(minLength: 8)
+            modeSelector
+            Spacer(minLength: 10)
+            shutterRow
+            Spacer(minLength: 10)
+            utilityRow
+            Spacer(minLength: 4)
         }
-        .padding(.top, VE.Space.s)
-        .padding(.bottom, VE.Space.m)
     }
 
-    private func errorBanner(_ message: String) -> some View {
-        HStack(spacing: 10) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(VE.warning)
-            Text(message)
-                .font(VE.Font.caption)
-                .foregroundStyle(VE.textSecondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 0)
-            Button(state.t("camera.error.retry")) {
-                errorMessage = nil
-                camera.clearFailure()
-            }
-            .font(.system(size: 13, weight: .semibold))
-            .foregroundStyle(VE.copper)
-            .buttonStyle(.plain)
-        }
-        .padding(.horizontal, VE.Space.m)
-        .padding(.vertical, 11)
-        .background(VE.surface, in: .rect(cornerRadius: VE.Radius.tile))
-        .padding(.horizontal, VE.Space.m)
-        .accessibilityIdentifier("camera.error")
-    }
-
-    private var controlRow: some View {
+    private var shutterRow: some View {
         HStack {
-            lastThumbnail
+            galleryThumbnail
             Spacer()
             shutter
             Spacer()
-            Button {} label: {
-                Image(systemName: "arrow.triangle.2.circlepath.camera")
-                    .font(.system(size: 17, weight: .medium))
-                    .foregroundStyle(VE.textSecondary)
-                    .frame(width: 52, height: 52)
-                    .background(VE.surface, in: .circle)
-            }
-            .disabled(isCapturing)
-            .accessibilityLabel("Alternar câmara")
+            roomButton
         }
-        .padding(.horizontal, 28)
+        .padding(.horizontal, 34)
     }
 
-    private var lastThumbnail: some View {
-        Group {
-            if let capture = state.captures.first {
-                CaptureImage(capture: capture)
-                    .frame(width: 52, height: 52)
-                    .clipShape(.rect(cornerRadius: 8))
-                    .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(VE.border, lineWidth: 1))
-            } else {
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(VE.surface)
-                    .frame(width: 52, height: 52)
+    private var galleryThumbnail: some View {
+        Button {
+            showGallery = true
+        } label: {
+            Group {
+                if let capture = state.captures.first {
+                    CaptureImage(capture: capture)
+                        .frame(width: 46, height: 46)
+                        .clipShape(.rect(cornerRadius: 9))
+                } else {
+                    RoundedRectangle(cornerRadius: 9)
+                        .fill(VE.surface)
+                        .frame(width: 46, height: 46)
+                        .overlay {
+                            Image(systemName: "photo.on.rectangle")
+                                .font(.system(size: 15, weight: .medium))
+                                .foregroundStyle(VE.textTertiary)
+                        }
+                }
             }
+            .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(VE.textPrimary.opacity(0.22), lineWidth: 1))
+            .frame(width: 52, height: 52)
+            .contentShape(.rect)
         }
-        .accessibilityHidden(true)
+        .buttonStyle(ShutterPressStyle(scale: 0.92))
+        .disabled(isCapturing)
+        .accessibilityLabel(state.t("camera.tool.gallery"))
     }
 
+    /// The secondary action: the current room's symbol, opening the room chooser.
+    private var roomButton: some View {
+        Button {
+            showRoomPicker = true
+        } label: {
+            Image(systemName: room.symbol)
+                .font(.system(size: 17, weight: .medium))
+                .foregroundStyle(VE.textPrimary.opacity(0.9))
+                .frame(width: 48, height: 48)
+                .background(VE.textPrimary.opacity(0.1), in: .circle)
+                .frame(width: 52, height: 52)
+                .contentShape(.circle)
+        }
+        .buttonStyle(ShutterPressStyle(scale: 0.9))
+        .disabled(isCapturing)
+        .accessibilityLabel(state.t("camera.tool.room"))
+    }
+
+    private var utilityRow: some View {
+        HStack(spacing: 36) {
+            utilityToggle(systemImage: "squareshape.split.3x3", title: state.t("camera.tool.grid"), isOn: $showsGrid)
+            utilityToggle(systemImage: "level", title: state.t("camera.tool.level"), isOn: $showsLevel)
+        }
+    }
+
+    private func utilityToggle(systemImage: String, title: String, isOn: Binding<Bool>) -> some View {
+        Button {
+            withAnimation(.easeOut(duration: 0.18)) { isOn.wrappedValue.toggle() }
+        } label: {
+            Image(systemName: systemImage)
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(isOn.wrappedValue ? VE.copper : VE.textPrimary.opacity(0.45))
+                .frame(width: 44, height: 36)
+                .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .sensoryFeedback(.selection, trigger: isOn.wrappedValue)
+        .accessibilityLabel(title)
+        .accessibilityValue(isOn.wrappedValue ? "On" : "Off")
+    }
+
+    /// White, tactile, unmistakably the most important control. While the sequence runs, a
+    /// copper arc travels the ring — the only capture feedback the person sees.
     private var shutter: some View {
         Button {
             Task { await runCapture() }
         } label: {
             ZStack {
                 Circle()
-                    .strokeBorder(VE.copper.opacity(0.35), lineWidth: 2)
-                    .frame(width: 92, height: 92)
-                    .scaleEffect(shutterPulse ? 1.08 : 1)
+                    .strokeBorder(VE.textPrimary.opacity(0.92), lineWidth: 3.5)
+                    .frame(width: 80, height: 80)
                 Circle()
                     .fill(
-                        LinearGradient(colors: [VE.copper, VE.copperDeep], startPoint: .top, endPoint: .bottom)
+                        LinearGradient(
+                            colors: [Color.white, VE.textPrimary.opacity(0.88)],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
                     )
-                    .frame(width: 74, height: 74)
-                    .opacity(isCapturing ? 0.75 : 1)
+                    .frame(width: isCapturing ? 56 : 66, height: isCapturing ? 56 : 66)
+                    .shadow(color: .black.opacity(0.25), radius: 3, y: 1)
                 Circle()
-                    .strokeBorder(VE.overlay.opacity(0.55), lineWidth: 3)
-                    .frame(width: 62, height: 62)
-                if isCapturing, let frame = activeFrame {
-                    Text(CaptureProfile.evLabel(frame))
-                        .font(.system(size: 20, weight: .bold, design: .monospaced))
-                        .foregroundStyle(Color(hex: 0x1B1410))
+                    .strokeBorder(VE.copper.opacity(isCapturing ? 0 : 0.45), lineWidth: 1)
+                    .frame(width: 70, height: 70)
+                if isCapturing {
+                    TimelineView(.animation) { context in
+                        let angle = context.date.timeIntervalSinceReferenceDate
+                            .truncatingRemainder(dividingBy: 1.1) / 1.1 * 360
+                        Circle()
+                            .trim(from: 0, to: 0.26)
+                            .stroke(VE.copper, style: StrokeStyle(lineWidth: 3.5, lineCap: .round))
+                            .frame(width: 76.5, height: 76.5)
+                            .rotationEffect(.degrees(angle))
+                    }
                 }
             }
+            .frame(width: 88, height: 88)
+            .contentShape(.circle)
+            .animation(.spring(response: 0.3, dampingFraction: 0.7), value: isCapturing)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(ShutterPressStyle(scale: 0.93))
+        .opacity(canCapture || isCapturing ? 1 : 0.45)
         .disabled(!canCapture)
         .accessibilityIdentifier("camera.shutter")
         .accessibilityLabel(state.t("home.cta.capture"))
@@ -758,5 +936,43 @@ struct CameraPrototypeView: View {
 
         withAnimation(.easeOut(duration: 0.2)) { activeFrame = nil }
         shutterPulse = false
+    }
+}
+
+/// Rule-of-thirds hairlines: present, photographic, never loud.
+private struct CompositionGrid: View {
+    var body: some View {
+        GeometryReader { geometry in
+            let w = geometry.size.width
+            let h = geometry.size.height
+            Path { path in
+                for fraction in [1.0 / 3.0, 2.0 / 3.0] {
+                    path.move(to: CGPoint(x: w * fraction, y: 0))
+                    path.addLine(to: CGPoint(x: w * fraction, y: h))
+                    path.move(to: CGPoint(x: 0, y: h * fraction))
+                    path.addLine(to: CGPoint(x: w, y: h * fraction))
+                }
+            }
+            .stroke(Color.white.opacity(0.22), lineWidth: 0.5)
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+/// Tactile press for camera controls.
+private struct ShutterPressStyle: ButtonStyle {
+    var scale: CGFloat
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? scale : 1)
+            .animation(.spring(response: 0.22, dampingFraction: 0.6), value: configuration.isPressed)
+    }
+}
+
+private extension RoomType {
+    /// Rooms photographed as outdoor scenes; the camera's mode dial groups them as Exterior.
+    var isExteriorScene: Bool {
+        self == .exterior || self == .balcony
     }
 }
