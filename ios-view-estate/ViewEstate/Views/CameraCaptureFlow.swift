@@ -97,9 +97,9 @@ struct CaptureOutcome: Sendable {
 
 /// The professional capture tool.
 ///
-/// An immersive, photography-first viewfinder: a full-width 4:3 live preview carrying only quiet
-/// photographic guides, a hairline top bar with the property and room, and every control gathered
-/// below the image around one dominant shutter. With `camera_native_enabled` OFF the viewfinder is
+/// An immersive, photography-first viewfinder: the image dominates nearly the whole screen,
+/// carrying only quiet photographic guides, a near-invisible header with the property and room,
+/// and every control gathered below the image around one dominant shutter. With `camera_native_enabled` OFF the viewfinder is
 /// a faithful UI simulation; with it ON the real rear camera runs behind exactly the same interface
 /// and one shutter tap photographs a real multi-exposure bracket. The exposure sequence is never
 /// surfaced — no EV ladder, no frame counter.
@@ -159,15 +159,15 @@ struct CameraPrototypeView: View {
 
     var body: some View {
         GeometryReader { geometry in
-            let controlsMinHeight: CGFloat = 178
+            // The image is always full width; on tall phones it takes the full 4:3 height.
+            let controlsMinHeight: CGFloat = 208
             let fullHeight = geometry.size.width * 4 / 3
             let previewHeight = max(0, min(fullHeight, geometry.size.height - controlsMinHeight))
-            let previewWidth = previewHeight < fullHeight ? previewHeight * 3 / 4 : geometry.size.width
 
             VStack(spacing: 0) {
                 viewfinder
-                    .frame(width: previewWidth, height: previewHeight)
                     .frame(maxWidth: .infinity)
+                    .frame(height: previewHeight)
                 bottomControls
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -223,42 +223,30 @@ struct CameraPrototypeView: View {
         }
     }
 
-    // MARK: - Top bar
+    // MARK: - Header
 
-    private var topBar: some View {
-        HStack(alignment: .center, spacing: 12) {
-            Button {
-                onClose()
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(VE.textPrimary)
-                    .frame(width: 32, height: 32)
-                    .background(.black.opacity(0.35), in: .circle)
-                    .frame(width: 44, height: 44)
-                    .contentShape(.rect)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel(state.t("common.close"))
-
+    /// Almost nothing: property and room centred, tiny, and a word of status only when useful.
+    /// Readiness is the absence of an error, so a stable camera shows no status at all.
+    private var headerOverlay: some View {
+        VStack(spacing: 5) {
             Button {
                 showRoomPicker = true
             } label: {
-                VStack(alignment: .leading, spacing: 1) {
+                VStack(spacing: 1) {
                     Text(property.title)
-                        .font(.system(size: 14, weight: .semibold))
+                        .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(VE.textPrimary)
                         .lineLimit(1)
                     HStack(spacing: 3) {
                         Text(state.roomName(room))
-                            .font(.system(size: 12, weight: .medium))
+                            .font(.system(size: 11, weight: .medium))
                             .foregroundStyle(VE.copper)
                         Image(systemName: "chevron.down")
-                            .font(.system(size: 8, weight: .bold))
+                            .font(.system(size: 7, weight: .bold))
                             .foregroundStyle(VE.copper.opacity(0.8))
                     }
                 }
-                .shadow(color: .black.opacity(0.4), radius: 4, y: 1)
+                .shadow(color: .black.opacity(0.45), radius: 3, y: 1)
                 .contentShape(.rect)
             }
             .buttonStyle(.plain)
@@ -266,37 +254,29 @@ struct CameraPrototypeView: View {
             .accessibilityLabel("\(property.title), \(state.roomName(room))")
             .accessibilityHint(state.t("camera.tool.room"))
 
-            Spacer(minLength: 8)
-
-            statusIndicator
+            statusText
         }
-        .padding(.leading, 6)
-        .padding(.trailing, VE.Space.m)
-        .padding(.top, 2)
+        .frame(maxWidth: .infinity)
+        .padding(.top, 6)
     }
 
-    /// A dot and a word — never a pill.
     @ViewBuilder
-    private var statusIndicator: some View {
+    private var statusText: some View {
         let status: (text: String, tint: Color)? = {
             if isCapturing { return (state.t("camera.capturing"), VE.copper) }
             if !state.isOnline { return (state.t("camera.offline"), VE.warning) }
-            guard isCameraLive else { return nil }
-            return (state.t(stabilityState.localizationKey), isStable ? VE.success : VE.warning)
+            guard isCameraLive, !isStable else { return nil }
+            return (state.t(stabilityState.localizationKey), VE.warning)
         }()
         if let status {
-            HStack(spacing: 6) {
-                Circle()
-                    .fill(status.tint)
-                    .frame(width: 6, height: 6)
-                Text(status.text)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(VE.textPrimary.opacity(0.88))
-            }
-            .shadow(color: .black.opacity(0.45), radius: 4, y: 1)
-            .contentTransition(.opacity)
-            .animation(.easeOut(duration: 0.2), value: status.text)
-            .accessibilityElement(children: .combine)
+            Text(status.text)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(status.tint)
+                .shadow(color: .black.opacity(0.45), radius: 3, y: 1)
+                .contentTransition(.opacity)
+                .animation(.easeOut(duration: 0.2), value: status.text)
+                .transition(.opacity)
+                .accessibilityElement(children: .combine)
         }
     }
 
@@ -329,8 +309,9 @@ struct CameraPrototypeView: View {
                     .allowsHitTesting(false)
             }
             .clipped()
-            .overlay(alignment: .top) { topBar }
+            .overlay(alignment: .top) { headerOverlay }
             .overlay(alignment: .bottom) { previewFooter }
+            .overlay(alignment: .bottom) { modeChip.padding(.bottom, 52) }
             .accessibilityElement(children: .contain)
             .accessibilityLabel(state.t("camera.prototype"))
     }
@@ -418,18 +399,15 @@ struct CameraPrototypeView: View {
         .accessibilityIdentifier("camera.error")
     }
 
-    /// Transient capture message and the lens indicator, resting on the bottom of the image.
+    /// Transient capture message, kept above the mode chip.
     private var previewFooter: some View {
-        VStack(spacing: 10) {
+        VStack {
             if let errorMessage, !isOpenFailure {
                 captureMessage(errorMessage)
                     .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
-            if !isOpenFailure, !(isNative && camera.access.needsSystemSettings) {
-                lensIndicator
-            }
         }
-        .padding(.bottom, 12)
+        .padding(.bottom, 104)
         .animation(.easeOut(duration: 0.22), value: errorMessage)
     }
 
@@ -456,41 +434,26 @@ struct CameraPrototypeView: View {
         .accessibilityIdentifier("camera.error")
     }
 
-    /// Shows the physical lens in use. A second option appears only once a device's ultra-wide
-    /// has been approved through calibration — it is never offered by default.
-    private var lensIndicator: some View {
-        let label = camera.activeLens == .ultraWide && isNative ? "0.5" : "1×"
-        return Text(label)
-            .font(.system(size: 11, weight: .semibold, design: .rounded))
-            .foregroundStyle(VE.copper)
-            .frame(width: 34, height: 34)
-            .background(.black.opacity(0.42), in: .circle)
-            .overlay(Circle().strokeBorder(VE.copper.opacity(0.25), lineWidth: 0.5))
-            .accessibilityLabel("\(state.t("camera.lens")) \(label)")
-    }
-
-    /// Camera-style alignment: fixed reference ticks, a horizon line that counter-rotates
-    /// against the phone's real roll, and a small centre marker. Green when level, amber when
-    /// not. No degrees are ever shown. The source image is never rotated.
+    /// Camera-style alignment cross: a fixed vertical reference, a horizontal horizon that
+    /// counter-rotates against the phone's real roll, and a centre marker. Ready green when
+    /// level, warning amber when not. No degrees are ever shown. The image is never rotated.
     private var levelGuide: some View {
         let tint: Color = isLevel ? VE.success : VE.warning
         return GeometryReader { geometry in
             let w = geometry.size.width
+            let h = geometry.size.height
             ZStack {
-                HStack(spacing: 0) {
-                    Rectangle().frame(width: 20, height: 1)
-                    Spacer().frame(width: w * 0.34)
-                    Rectangle().frame(width: 20, height: 1)
-                }
-                .foregroundStyle(isLevel ? tint.opacity(0.9) : VE.textPrimary.opacity(0.55))
+                Rectangle()
+                    .fill(tint.opacity(0.8))
+                    .frame(width: 1, height: h * 0.26)
 
                 Rectangle()
-                    .fill(tint.opacity(isLevel ? 0.9 : 0.95))
-                    .frame(width: w * 0.3, height: 1.2)
+                    .fill(tint)
+                    .frame(width: w * 0.34, height: 1.2)
                     .rotationEffect(.degrees(-levelAngle))
 
                 Circle()
-                    .strokeBorder(tint.opacity(0.85), lineWidth: 1)
+                    .strokeBorder(tint.opacity(0.9), lineWidth: 1)
                     .frame(width: 9, height: 9)
                     .background(Circle().fill(.black.opacity(0.15)))
             }
@@ -511,12 +474,12 @@ struct CameraPrototypeView: View {
 
     private var isExteriorMode: Bool { room.isExteriorScene }
 
-    /// Interior / Exterior as a camera mode dial. Switching mode moves to the first room of that
-    /// kind; detailed room switching stays in the top bar and the room button.
-    private var modeSelector: some View {
+    /// A small floating mode control over the lower edge of the image. Switching mode moves to
+    /// the first room of that kind; detailed room switching stays in the header and room button.
+    private var modeChip: some View {
         let interior = availableRooms.first { !$0.isExteriorScene }
         let exterior = availableRooms.first { $0.isExteriorScene }
-        return HStack(spacing: 26) {
+        return HStack(spacing: 18) {
             if let interior {
                 modeLabel(state.t("camera.mode.interior"), active: !isExteriorMode) {
                     guard isExteriorMode else { return }
@@ -530,24 +493,22 @@ struct CameraPrototypeView: View {
                 }
             }
         }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 6)
+        .background(.black.opacity(0.45), in: .capsule)
         .disabled(isCapturing)
         .animation(.spring(response: 0.3, dampingFraction: 0.85), value: isExteriorMode)
+        .accessibilityElement(children: .contain)
     }
 
     private func modeLabel(_ title: String, active: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            VStack(spacing: 5) {
-                Text(title.uppercased())
-                    .font(.system(size: 12, weight: .semibold))
-                    .kerning(1.4)
-                    .foregroundStyle(active ? VE.copper : VE.textPrimary.opacity(0.5))
-                Circle()
-                    .fill(VE.copper)
-                    .frame(width: 4, height: 4)
-                    .opacity(active ? 1 : 0)
-            }
-            .frame(minHeight: 32)
-            .contentShape(.rect)
+            Text(title.uppercased())
+                .font(.system(size: 11, weight: .semibold))
+                .kerning(1.2)
+                .foregroundStyle(active ? VE.copper : VE.textPrimary.opacity(0.55))
+                .frame(minHeight: 26)
+                .contentShape(.rect)
         }
         .buttonStyle(.plain)
         .accessibilityAddTraits(active ? [.isSelected] : [])
@@ -587,14 +548,75 @@ struct CameraPrototypeView: View {
 
     private var bottomControls: some View {
         VStack(spacing: 0) {
-            Spacer(minLength: 8)
-            modeSelector
-            Spacer(minLength: 10)
+            Spacer(minLength: 6)
+            zoomRow
+            Spacer(minLength: 6)
             shutterRow
-            Spacer(minLength: 10)
-            utilityRow
-            Spacer(minLength: 4)
+            Spacer(minLength: 12)
+            controlToolbar
+            Spacer(minLength: 2)
         }
+    }
+
+    /// Zoom sits just below the image, like the reference. 0.5× appears only while the Camera
+    /// Lab forces the ultra-wide — an uncalibrated lens is never exposed in production.
+    private var zoomRow: some View {
+        let ultraWideActive = isNative && camera.activeLens == .ultraWide
+        return HStack(spacing: 56) {
+            if ultraWideActive {
+                Text("0.5×")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(VE.copper)
+            }
+            Text("1×")
+                .font(.system(size: 15, weight: ultraWideActive ? .regular : .semibold))
+                .foregroundStyle(ultraWideActive ? VE.textSecondary : VE.textPrimary)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(state.t("camera.lens")) \(ultraWideActive ? "0.5" : "1")")
+    }
+
+    /// Close on the left; the two tools that actually work on the right. Nothing fake.
+    private var controlToolbar: some View {
+        HStack {
+            Button {
+                onClose()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(VE.textPrimary)
+                    .frame(width: 40, height: 40)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12)
+                            .strokeBorder(VE.textPrimary.opacity(0.35), lineWidth: 1)
+                    )
+                    .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(state.t("common.close"))
+
+            Spacer()
+
+            toolbarToggle(systemImage: "square.grid.3x3", title: state.t("camera.tool.grid"), isOn: $showsGrid)
+            toolbarToggle(systemImage: "level", title: state.t("camera.tool.level"), isOn: $showsLevel)
+        }
+        .padding(.horizontal, 24)
+    }
+
+    private func toolbarToggle(systemImage: String, title: String, isOn: Binding<Bool>) -> some View {
+        Button {
+            withAnimation(.easeOut(duration: 0.18)) { isOn.wrappedValue.toggle() }
+        } label: {
+            Image(systemName: systemImage)
+                .font(.system(size: 17, weight: .medium))
+                .foregroundStyle(isOn.wrappedValue ? VE.copper : VE.textPrimary.opacity(0.55))
+                .frame(width: 44, height: 40)
+                .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .sensoryFeedback(.selection, trigger: isOn.wrappedValue)
+        .accessibilityLabel(title)
+        .accessibilityValue(isOn.wrappedValue ? "On" : "Off")
     }
 
     private var shutterRow: some View {
@@ -605,7 +627,7 @@ struct CameraPrototypeView: View {
             Spacer()
             roomButton
         }
-        .padding(.horizontal, 34)
+        .padding(.horizontal, 32)
     }
 
     private var galleryThumbnail: some View {
@@ -615,22 +637,22 @@ struct CameraPrototypeView: View {
             Group {
                 if let capture = state.captures.first {
                     CaptureImage(capture: capture)
-                        .frame(width: 46, height: 46)
-                        .clipShape(.rect(cornerRadius: 9))
+                        .frame(width: 44, height: 44)
+                        .clipShape(.circle)
                 } else {
-                    RoundedRectangle(cornerRadius: 9)
-                        .fill(VE.surface)
-                        .frame(width: 46, height: 46)
+                    Circle()
+                        .fill(VE.textPrimary.opacity(0.12))
+                        .frame(width: 44, height: 44)
                         .overlay {
                             Image(systemName: "photo.on.rectangle")
-                                .font(.system(size: 15, weight: .medium))
+                                .font(.system(size: 14, weight: .medium))
                                 .foregroundStyle(VE.textTertiary)
                         }
                 }
             }
-            .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(VE.textPrimary.opacity(0.22), lineWidth: 1))
-            .frame(width: 52, height: 52)
-            .contentShape(.rect)
+            .overlay(Circle().strokeBorder(VE.textPrimary.opacity(0.22), lineWidth: 1))
+            .frame(width: 50, height: 50)
+            .contentShape(.circle)
         }
         .buttonStyle(ShutterPressStyle(scale: 0.92))
         .disabled(isCapturing)
@@ -643,39 +665,16 @@ struct CameraPrototypeView: View {
             showRoomPicker = true
         } label: {
             Image(systemName: room.symbol)
-                .font(.system(size: 17, weight: .medium))
+                .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(VE.textPrimary.opacity(0.9))
-                .frame(width: 48, height: 48)
+                .frame(width: 44, height: 44)
                 .background(VE.textPrimary.opacity(0.1), in: .circle)
-                .frame(width: 52, height: 52)
+                .frame(width: 50, height: 50)
                 .contentShape(.circle)
         }
         .buttonStyle(ShutterPressStyle(scale: 0.9))
         .disabled(isCapturing)
         .accessibilityLabel(state.t("camera.tool.room"))
-    }
-
-    private var utilityRow: some View {
-        HStack(spacing: 36) {
-            utilityToggle(systemImage: "squareshape.split.3x3", title: state.t("camera.tool.grid"), isOn: $showsGrid)
-            utilityToggle(systemImage: "level", title: state.t("camera.tool.level"), isOn: $showsLevel)
-        }
-    }
-
-    private func utilityToggle(systemImage: String, title: String, isOn: Binding<Bool>) -> some View {
-        Button {
-            withAnimation(.easeOut(duration: 0.18)) { isOn.wrappedValue.toggle() }
-        } label: {
-            Image(systemName: systemImage)
-                .font(.system(size: 15, weight: .medium))
-                .foregroundStyle(isOn.wrappedValue ? VE.copper : VE.textPrimary.opacity(0.45))
-                .frame(width: 44, height: 36)
-                .contentShape(.rect)
-        }
-        .buttonStyle(.plain)
-        .sensoryFeedback(.selection, trigger: isOn.wrappedValue)
-        .accessibilityLabel(title)
-        .accessibilityValue(isOn.wrappedValue ? "On" : "Off")
     }
 
     /// White, tactile, unmistakably the most important control. While the sequence runs, a
@@ -699,7 +698,7 @@ struct CameraPrototypeView: View {
                     .frame(width: isCapturing ? 56 : 66, height: isCapturing ? 56 : 66)
                     .shadow(color: .black.opacity(0.25), radius: 3, y: 1)
                 Circle()
-                    .strokeBorder(VE.copper.opacity(isCapturing ? 0 : 0.45), lineWidth: 1)
+                    .strokeBorder(VE.copper.opacity(isCapturing ? 0 : 0.3), lineWidth: 1)
                     .frame(width: 70, height: 70)
                 if isCapturing {
                     TimelineView(.animation) { context in
