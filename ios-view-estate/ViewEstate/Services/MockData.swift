@@ -86,7 +86,8 @@ enum MockData {
             jobState: jobState,
             createdAt: createdAt,
             isFavorite: favorite,
-            assets: lineage(frameCount: frameCount, createdAt: createdAt, includeMaster: jobState == .ready)
+            // Fixture photographs have no real HDR file, so no HDR master version is claimed.
+            assets: lineage(frameCount: frameCount, createdAt: createdAt, includeMaster: false)
         )
     }
 

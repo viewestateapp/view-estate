@@ -55,6 +55,14 @@ enum CaptureManifestBuilder {
                 + "frames=\(manifest.frameCountDescription) size=\(manifest.totalSizeDescription) "
                 + "quality=\(manifest.quality?.qualityClass.devLabel ?? "—")"
         )
+        if let audit = manifest.audit {
+            VELog.camera(
+                "bracket audit requested=\(audit.requestedExposures) requests=\(audit.nativeRequests) "
+                    + "callbacks=\(audit.callbacks) persisted=\(audit.persistedFiles) "
+                    + "uniqueHashes=\(audit.uniqueHashes) real=\(audit.realFrames) "
+                    + "distinct=\(audit.distinctExposureLevels) validated=\(audit.validatedProfile.devLabel)"
+            )
+        }
         return manifest
     }
 
@@ -136,7 +144,12 @@ enum CaptureManifestBuilder {
             frames: result.frames.sorted { $0.sequenceIndex < $1.sequenceIndex },
             requestedExposureValues: result.plan.exposureValues,
             quality: quality,
-            qaTag: context.qaTag
+            qaTag: context.qaTag,
+            audit: BracketAuditor.audit(
+                frames: result.frames,
+                plan: result.plan,
+                evidence: result.callbackEvidence
+            )
         )
     }
 }

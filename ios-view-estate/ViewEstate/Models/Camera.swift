@@ -57,6 +57,8 @@ enum CameraError: String, Error, Sendable, CaseIterable {
     case manifestInvalid = "MANIFEST_INVALID"
     case focusTimeout = "FOCUS_TIMEOUT"
     case insufficientStorage = "INSUFFICIENT_STORAGE"
+    /// Two exposures of one attempt are byte-identical, or resolved to the same ladder position.
+    case duplicateFrame = "DUPLICATE_FRAME"
 
     /// Stable code for logs and the developer panel.
     var code: String { rawValue }
@@ -201,9 +203,10 @@ struct CameraDiagnostics: Sendable {
         sessionRuns.count - Set(sessionRuns.map(\.clientCaptureID)).count
     }
 
-    /// Real pixels, simulated master. The two are never confused internally.
+    /// Real pixels; the HDR source follows whether the real pipeline is switched on.
     var captureSource: CaptureSource { mode.isNative ? .nativeReal : .simulated }
-    var hdrSource: HDRSource { FeatureFlags.hdrProcessingEnabled ? .real : .mock }
+    var realHDREnabled: Bool = FeatureFlags.realHDREnabled
+    var hdrSource: HDRSource { realHDREnabled && mode.isNative ? .realProcessing : .mock }
 
     var captureDurationDescription: String? {
         guard let lastCaptureSeconds else { return nil }

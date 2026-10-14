@@ -123,7 +123,8 @@ struct PhotoDetailView: View {
             ScrollView {
                 if let capture {
                     VStack(alignment: .leading, spacing: VE.Space.m) {
-                        CaptureImage(capture: capture, contentMode: .fit)
+                        // EV 0 while preparing, the real HDR master once it exists.
+                        CaptureImage(capture: capture, contentMode: .fit, maxPixel: 2400)
                             .aspectRatio(4 / 3, contentMode: .fit)
                             .clipShape(.rect(cornerRadius: VE.Radius.card))
 

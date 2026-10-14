@@ -100,6 +100,21 @@ final class AppState {
     /// Seconds a mock preparation takes before reaching its final state.
     var preparationSeconds: Double = 4
 
+    // MARK: - Real HDR
+
+    /// `real_hdr_enabled`. When on, every valid native capture is merged by the real pipeline;
+    /// a bracket without real, distinct exposures is still refused by its own audit.
+    var realHDREnabled: Bool = FeatureFlags.realHDREnabled {
+        didSet { cameraDiagnostics.realHDREnabled = realHDREnabled }
+    }
+    /// Live diagnostics of every HDR job in this session. Developer panel only.
+    private(set) var hdrJobs: [UUID: HDRJobDiagnostics] = [:]
+    /// Identifies the current job of a capture, so a late result from a timed-out or replaced
+    /// job can never overwrite a newer state.
+    private var hdrJobTokens: [UUID: UUID] = [:]
+    /// Overridable for tests.
+    var hdrTimeoutSeconds: Double = HDRProcessingService.timeoutSeconds
+
     // MARK: - Camera
 
     /// Which camera the capture flow uses. Switchable in development so the simulated
@@ -319,7 +334,7 @@ final class AppState {
             else { continue }
 
             let createdAt = manifest.completedAt ?? manifest.startedAt
-            let item = CaptureItem(
+            var item = CaptureItem(
                 id: manifest.captureID ?? UUID(),
                 clientCaptureID: manifest.clientCaptureID,
                 propertyID: property.id,
@@ -334,8 +349,17 @@ final class AppState {
                 localFile: reference.localPhotoFile,
                 manifest: manifest
             )
+            // A master that was already generated and still verifies is reattached as is.
+            if let record = HDRMasterStore.read(clientCaptureID: manifest.clientCaptureID) {
+                attachMaster(record, to: &item)
+                item.jobState = .ready
+            }
             captures.insert(item, at: 0)
             restored += 1
+            // Nothing may stay preparing forever after a relaunch.
+            if item.jobState != .ready {
+                startPreparation(for: item.id)
+            }
         }
 
         if restored > 0 {
@@ -430,7 +454,23 @@ final class AppState {
 
     /// Background preparation of one capture. Independent per capture, so photographing
     /// another room while one is still preparing is never blocked.
+    ///
+    /// A valid native capture goes through the real HDR pipeline. Everything else (simulated
+    /// captures, or the real pipeline switched off) runs the mock preparation, which never
+    /// claims an HDR master exists.
     private func startPreparation(for id: UUID) {
+        guard let capture = captures.first(where: { $0.id == id }) else { return }
+        if realHDREnabled, let manifest = capture.manifest, manifest.state.isValid {
+            startRealHDR(for: id, manifest: manifest)
+        } else {
+            startMockPreparation(for: id)
+        }
+    }
+
+    private func startMockPreparation(for id: UUID) {
+        if let index = captures.firstIndex(where: { $0.id == id }) {
+            captures[index].hdrState = .mock
+        }
         preparationTasks[id]?.cancel()
         preparationTasks[id] = Task { [weak self] in
             guard let self else { return }
@@ -455,23 +495,144 @@ final class AppState {
         captures[index].jobState = jobState
     }
 
+    /// Mock preparation result. No HDR master asset is ever appended here: no file exists.
     private func finishPreparation(_ id: UUID) {
         guard let index = captures.firstIndex(where: { $0.id == id }) else { return }
         let outcome = captureResultMode
         captures[index].jobState = outcome.resolvedJobState
         captures[index].isPendingSync = false
-
-        if outcome == .success,
-           let original = captures[index].originalAsset,
-           !captures[index].assets.contains(where: { $0.type == .hdrMaster }) {
-            // The original is appended to, never replaced.
-            captures[index].assets.append(MockData.hdrMaster(parent: original, createdAt: .now))
-        }
+        captures[index].hdrState = .mock
 
         preparationTasks[id] = nil
         if preparingCount == 0 && isOnline {
             syncState = .synced
         }
+    }
+
+    // MARK: - Real HDR job
+
+    /// Runs the real HDR pipeline for one capture, off the main actor, under a watchdog.
+    /// Processing is local: it needs no connectivity and costs no AI credits.
+    private func startRealHDR(for id: UUID, manifest: CaptureManifest) {
+        guard let index = captures.firstIndex(where: { $0.id == id }) else { return }
+        preparationTasks[id]?.cancel()
+        let token = UUID()
+        hdrJobTokens[id] = token
+        captures[index].hdrState = .pending
+        captures[index].jobState = .queued
+        let now = Date()
+        hdrJobs[id] = HDRJobDiagnostics(jobStartedAt: now, stage: .queued, lastProgressAt: now)
+        let timeout = hdrTimeoutSeconds
+
+        preparationTasks[id] = Task { [weak self] in
+            guard let self else { return }
+            // The camera always has priority over background work.
+            while self.isCapturing && !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(300))
+            }
+            guard !Task.isCancelled, self.hdrJobTokens[id] == token else { return }
+            self.setJobState(id, .processing)
+            self.setHDRState(id, .processing)
+
+            let watchdog = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(timeout))
+                guard !Task.isCancelled else { return }
+                self?.failHDR(id, token: token, code: "HDR_TIMEOUT", kind: .technical)
+            }
+
+            let progress: @Sendable (HDRStage) -> Void = { stage in
+                Task { @MainActor [weak self] in
+                    self?.updateHDRStage(id, token: token, stage: stage)
+                }
+            }
+            let result = await Task.detached(priority: .utility) {
+                HDRProcessingService.process(manifest: manifest, captureID: id, progress: progress)
+            }.value
+            watchdog.cancel()
+
+            switch result {
+            case .success(let record):
+                self.completeHDR(id, token: token, record: record)
+            case .failure(let failure):
+                self.failHDR(id, token: token, code: failure.code, kind: failure.kind)
+            }
+        }
+    }
+
+    private func setHDRState(_ id: UUID, _ hdrState: HDRState) {
+        guard let index = captures.firstIndex(where: { $0.id == id }) else { return }
+        captures[index].hdrState = hdrState
+    }
+
+    private func updateHDRStage(_ id: UUID, token: UUID, stage: HDRStage) {
+        guard hdrJobTokens[id] == token, var job = hdrJobs[id], job.finishedAt == nil else { return }
+        job.stage = stage
+        job.lastProgressAt = .now
+        hdrJobs[id] = job
+    }
+
+    /// READY only with a verified master on disk. The primary image switches to it at once.
+    private func completeHDR(_ id: UUID, token: UUID, record: HDRMasterRecord) {
+        guard hdrJobTokens[id] == token, let index = captures.firstIndex(where: { $0.id == id }) else { return }
+        attachMaster(record, to: &captures[index])
+        captures[index].jobState = .ready
+        closeHDRJob(id, stage: .done, errorCode: nil)
+        VELog.camera(
+            "hdr ready capture=\(id.uuidString.prefix(8)) size=\(record.sizeDescription) "
+                + "\(record.dimensionDescription) t=\(String(format: "%.1f", record.processingSeconds))s "
+                + "dr=\(record.dynamicRangeVerdict)"
+        )
+        finishJob(id)
+    }
+
+    private func failHDR(_ id: UUID, token: UUID, code: String, kind: HDRProcessingFailure.Kind) {
+        guard hdrJobTokens[id] == token, let index = captures.firstIndex(where: { $0.id == id }) else { return }
+        // Invalidate the token: a late result of this job can no longer change anything.
+        hdrJobTokens[id] = UUID()
+        switch kind {
+        case .technical:
+            captures[index].hdrState = .failed
+            captures[index].jobState = .failed
+        case .sourceRejected:
+            captures[index].hdrState = .sourceRejected
+            captures[index].jobState = .needsReview
+        }
+        closeHDRJob(id, stage: .failed, errorCode: code)
+        VELog.cameraError(code, "hdr capture=\(id.uuidString.prefix(8))")
+        finishJob(id)
+    }
+
+    private func closeHDRJob(_ id: UUID, stage: HDRStage, errorCode: String?) {
+        guard var job = hdrJobs[id] else { return }
+        job.stage = stage
+        job.finishedAt = .now
+        job.lastProgressAt = .now
+        job.errorCode = errorCode
+        hdrJobs[id] = job
+    }
+
+    private func finishJob(_ id: UUID) {
+        preparationTasks[id] = nil
+        if preparingCount == 0 && isOnline && pendingSyncCount == 0 {
+            syncState = .synced
+        }
+    }
+
+    /// Appends the real master as a derived version. The original stays first and untouched.
+    private func attachMaster(_ record: HDRMasterRecord, to item: inout CaptureItem) {
+        item.hdrMaster = record
+        item.hdrState = .generated
+        guard !item.assets.contains(where: { $0.type == .hdrMaster }) else { return }
+        item.assets.append(
+            AssetVersion(
+                id: record.assetID,
+                parentAssetID: item.originalAsset?.id,
+                type: .hdrMaster,
+                label: "HDR Master",
+                versionNumber: 1,
+                createdAt: record.createdAt
+            )
+        )
     }
 
     func toggleFavorite(_ capture: CaptureItem) {
@@ -594,6 +755,8 @@ final class AppState {
     func devReset() {
         for task in preparationTasks.values { task.cancel() }
         preparationTasks = [:]
+        hdrJobs = [:]
+        hdrJobTokens = [:]
         properties = MockData.properties()
         captures = MockData.captures()
         transactions = MockData.creditHistory()

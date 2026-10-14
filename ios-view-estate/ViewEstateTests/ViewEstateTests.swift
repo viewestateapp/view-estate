@@ -88,8 +88,9 @@ struct CaptureFlowTests {
         #expect(state.transactions.count == transactions)
     }
 
-    // Preparation moves A preparar → Pronta and derives an HDR master from the immutable original.
-    @Test func preparationReachesReadyAndDerivesHDRMaster() async throws {
+    // A simulated capture still moves A preparar → Pronta, but never claims an HDR master:
+    // no real HDR file exists for it.
+    @Test func mockPreparationReachesReadyWithoutClaimingAnHDRMaster() async throws {
         let state = makeState()
         let property = try #require(state.properties.first)
 
@@ -105,7 +106,10 @@ struct CaptureFlowTests {
 
         #expect(prepared.status == .ready)
         #expect(prepared.originalAsset?.id == original.id)
-        #expect(prepared.assets.contains { $0.type == .hdrMaster })
+        #expect(!prepared.assets.contains { $0.type == .hdrMaster })
+        #expect(prepared.hdrMaster == nil)
+        #expect(prepared.hdrState == .mock)
+        #expect(prepared.hdrSource == .mock)
         #expect(prepared.assets.filter { $0.type == .original }.count == 1)
     }
 
@@ -376,7 +380,10 @@ struct NativeCaptureTests {
 
     private static func sampleJPEG(width: Int, height: Int) -> Data {
         let size = CGSize(width: width, height: height)
-        let image = UIGraphicsImageRenderer(size: size).image { context in
+        // Pixel-exact: the default renderer format uses the screen scale (3× on most simulators).
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let image = UIGraphicsImageRenderer(size: size, format: format).image { context in
             UIColor.darkGray.setFill()
             context.fill(CGRect(origin: .zero, size: size))
         }
@@ -1589,5 +1596,342 @@ struct CameraCalibrationTests {
             context.fill(CGRect(origin: .zero, size: size))
         }
         return image.jpegData(compressionQuality: 0.9) ?? Data()
+    }
+}
+
+/// Real capture audit and the first real HDR pipeline.
+///
+/// Physical bracket behaviour can only be proven on an iPhone; these tests lock the rules the
+/// audit and the pipeline must obey — real files only, unique hashes, truthful profile naming,
+/// a verified master file, the original untouched, READY only with the file, and 0 credits.
+@MainActor
+@Suite(.serialized)
+struct RealHDRPipelineTests {
+
+    // MARK: - Bracket audit
+
+    // Nine real, unique, materially different files with nine callbacks are a truthful FULL_9.
+    @Test func truthfulFullLadderIsReportedAsSuch() throws {
+        let id = UUID()
+        defer { CaptureBundleStore.delete(clientCaptureID: id) }
+        let frames = try Self.writeScene(.full9, clientCaptureID: id)
+        let plan = BracketPlan(profile: .full9, segments: [[-4, -3, -2, -1, 0], [1, 2, 3, 4]], reason: "")
+
+        let audit = BracketAuditor.audit(frames: frames, plan: plan, evidence: Self.evidence(9, requests: [5, 4]))
+
+        #expect(audit.callbacks == 9)
+        #expect(audit.nativeRequests == 2)
+        #expect(audit.persistedFiles == 9)
+        #expect(audit.verifiedChecksums == 9)
+        #expect(audit.uniqueHashes == 9)
+        #expect(audit.realFrames == 9)
+        #expect(audit.ev0Frames == 1)
+        #expect(audit.distinctExposureLevels == 9)
+        #expect(audit.isTruthful)
+        #expect(audit.validatedProfile == .full9)
+        #expect(audit.supportsHDR)
+    }
+
+    // Requested count is never used as captured count: a byte-identical pair is one real frame,
+    // the profile is not called FULL_9, and the bundle is refused.
+    @Test func duplicateFilesAreNeverCountedAsRealFrames() throws {
+        let id = UUID()
+        defer { CaptureBundleStore.delete(clientCaptureID: id) }
+        var frames = try Self.writeScene(.full9, clientCaptureID: id)
+        // Overwrite +4 with the +3 bytes, as an index overwrite would.
+        let duplicate = try #require(CaptureBundleStore.loadData(frames[7]))
+        frames[8] = try CaptureBundleStore.writeFrame(
+            photoData: duplicate, clientCaptureID: id, sequenceIndex: 8, requestedEV: 4,
+            orientation: .portrait, cameraID: "test-camera", lensType: "Rear Wide"
+        )
+        frames[8].exposureDurationSeconds = frames[7].exposureDurationSeconds
+        frames[8].iso = frames[7].iso
+
+        let audit = BracketAuditor.audit(frames: frames, plan: Self.plan(.full9), evidence: Self.evidence(9, requests: [9]))
+
+        #expect(audit.uniqueHashes == 8)
+        #expect(audit.realFrames == 7)
+        #expect(!audit.isTruthful)
+        #expect(audit.validatedProfile != .full9)
+
+        let manifest = Self.manifest(frames: frames, clientCaptureID: id, profile: .full9)
+        #expect(CaptureBundleValidator.validate(manifest) == .duplicateFrame)
+    }
+
+    // Two requested EVs the sensor photographed identically are reported, and the profile is
+    // named by the exposures that really differ.
+    @Test func identicalPhysicalExposuresReduceTheValidatedProfile() throws {
+        let id = UUID()
+        defer { CaptureBundleStore.delete(clientCaptureID: id) }
+        var frames = try Self.writeScene(.full9, clientCaptureID: id)
+        frames[0].exposureDurationSeconds = frames[1].exposureDurationSeconds
+        frames[0].iso = frames[1].iso
+
+        let audit = BracketAuditor.audit(frames: frames, plan: Self.plan(.full9), evidence: Self.evidence(9, requests: [9]))
+
+        #expect(audit.realFrames == 9)
+        #expect(audit.distinctExposureLevels == 8)
+        #expect(audit.duplicateExposurePairs == ["-4/-3"])
+        #expect(audit.validatedProfile == .standard7)
+        #expect(!audit.isTruthful)
+    }
+
+    // MARK: - Pipeline
+
+    // The pipeline writes a real, readable master next to untouched sources and recovers
+    // highlight and shadow detail EV 0 had lost.
+    @Test func realPipelineWritesAVerifiedMasterAndRecoversRange() throws {
+        let id = UUID()
+        defer { CaptureBundleStore.delete(clientCaptureID: id) }
+        let frames = try Self.writeScene(.full9, clientCaptureID: id)
+        let sourceChecksums = frames.map(\.checksum)
+        var manifest = Self.manifest(frames: frames, clientCaptureID: id, profile: .full9)
+        manifest.state = .localReady
+        let captureID = UUID()
+
+        let result = HDRProcessingService.process(manifest: manifest, captureID: captureID) { _ in }
+        let record = try result.get()
+
+        let url = try #require(CaptureBundleStore.url(clientCaptureID: id, fileName: record.fileName))
+        let data = try Data(contentsOf: url)
+        #expect(data.count == record.byteCount)
+        #expect(CaptureBundleStore.checksum(data) == record.checksum)
+        #expect(record.captureID == captureID)
+        #expect(record.pipelineVersion == HDRProcessingService.pipelineVersion)
+        #expect(record.pixelWidth == Self.width && record.pixelHeight == Self.height)
+        #expect(record.sourceFrameCount == 9)
+        #expect(HDRMasterStore.read(clientCaptureID: id)?.checksum == record.checksum)
+
+        // Sources are never modified.
+        for (frame, checksum) in zip(frames, sourceChecksums) {
+            let bytes = try #require(CaptureBundleStore.loadData(frame))
+            #expect(CaptureBundleStore.checksum(bytes) == checksum)
+        }
+
+        // EV 0 clips the bright half and crushes the dark end; the master recovers both.
+        #expect(record.ev0HighlightClipPercent > 10)
+        #expect(record.hdrHighlightClipPercent < record.ev0HighlightClipPercent * 0.6)
+        #expect(record.hdrShadowClipPercent <= record.ev0ShadowClipPercent)
+        #expect(record.dynamicRangeVerdict == "PASS")
+    }
+
+    // A bracket without darker and brighter evidence cannot make an HDR: source rejected.
+    @Test func singleExposureIsRejectedAsHDRSource() throws {
+        let id = UUID()
+        defer { CaptureBundleStore.delete(clientCaptureID: id) }
+        let frames = try Self.writeScene(.single, clientCaptureID: id)
+        var manifest = Self.manifest(frames: frames, clientCaptureID: id, profile: .single)
+        manifest.state = .localReady
+
+        let result = HDRProcessingService.process(manifest: manifest, captureID: UUID()) { _ in }
+        guard case .failure(let failure) = result else {
+            Issue.record("A single exposure must never produce an HDR master")
+            return
+        }
+        #expect(failure.kind == .sourceRejected)
+        #expect(failure.code == "HDR_INSUFFICIENT_EXPOSURES")
+        #expect(HDRMasterStore.read(clientCaptureID: id) == nil)
+    }
+
+    // MARK: - App flow
+
+    // PREPARING → READY with a real file: the primary image switches to the master, the
+    // original stays first and untouched, and no credit moves.
+    @Test func captureReachesReadyOnlyWithARealMasterAndCostsNothing() async throws {
+        let state = AppState()
+        state.realHDREnabled = true
+        let property = try #require(state.properties.first)
+        let balance = state.wallet.total
+        let transactions = state.transactions.count
+
+        let attempt = try #require(state.beginCaptureAttempt(property: property, room: .living))
+        defer { CaptureBundleStore.delete(clientCaptureID: attempt.id) }
+        let frames = try Self.writeScene(.full9, clientCaptureID: attempt.id)
+        var manifest = Self.manifest(frames: frames, clientCaptureID: attempt.id, profile: .full9)
+        manifest.propertyID = property.id
+        manifest.state = .localReady
+        try CaptureBundleStore.writeManifest(manifest)
+
+        let capture = state.registerCapture(
+            attempt: attempt, property: property, room: .living,
+            frameCount: manifest.actualFrameCount,
+            localFile: manifest.referenceFrame?.localPhotoFile,
+            manifest: manifest
+        )
+        state.endCaptureSequence()
+
+        // Openable at once, showing EV 0.
+        #expect(capture.status == .preparing)
+        #expect(capture.displayFile?.fileName == manifest.referenceFrame?.fileName)
+        #expect(capture.hdrMaster == nil)
+
+        var live = capture
+        for _ in 0..<150 {
+            try await Task.sleep(for: .milliseconds(100))
+            live = try #require(state.captures.first { $0.id == capture.id })
+            if live.status != .preparing { break }
+        }
+
+        #expect(live.status == .ready)
+        #expect(live.hdrState == .generated)
+        #expect(live.hdrSource == .real)
+        let master = try #require(live.hdrMaster)
+        #expect(live.displayFile?.fileName == master.fileName)
+        #expect(live.assets.first?.type == .original)
+        #expect(live.assets.contains { $0.type == .hdrMaster && $0.id == master.assetID })
+        #expect(state.hdrJobs[capture.id]?.stage == .done)
+        #expect(state.hdrJobs[capture.id]?.errorCode == nil)
+
+        #expect(state.wallet.total == balance)
+        #expect(state.transactions.count == transactions)
+    }
+
+    // A source that cannot make an HDR ends in "Precisa de nova captura", never endless PREPARING.
+    @Test func rejectedSourceEndsInNeedsRecapture() async throws {
+        let state = AppState()
+        state.realHDREnabled = true
+        let property = try #require(state.properties.first)
+
+        let attempt = try #require(state.beginCaptureAttempt(property: property, room: .kitchen))
+        defer { CaptureBundleStore.delete(clientCaptureID: attempt.id) }
+        let frames = try Self.writeScene(.single, clientCaptureID: attempt.id)
+        var manifest = Self.manifest(frames: frames, clientCaptureID: attempt.id, profile: .single)
+        manifest.state = .localReady
+        let capture = state.registerCapture(
+            attempt: attempt, property: property, room: .kitchen, frameCount: 1,
+            localFile: manifest.referenceFrame?.localPhotoFile, manifest: manifest
+        )
+        state.endCaptureSequence()
+
+        var live = capture
+        for _ in 0..<50 {
+            try await Task.sleep(for: .milliseconds(100))
+            live = try #require(state.captures.first { $0.id == capture.id })
+            if live.status != .preparing { break }
+        }
+        #expect(live.status == .needsRecapture)
+        #expect(live.hdrState == .sourceRejected)
+        #expect(live.hdrMaster == nil)
+        #expect(!live.assets.contains { $0.type == .hdrMaster })
+        #expect(state.hdrJobs[capture.id]?.errorCode == "HDR_INSUFFICIENT_EXPOSURES")
+    }
+
+    // The watchdog closes a job that runs too long: Erro, never endless PREPARING.
+    @Test func watchdogEndsAStuckJob() async throws {
+        let state = AppState()
+        state.realHDREnabled = true
+        state.hdrTimeoutSeconds = 0.001
+        let property = try #require(state.properties.first)
+
+        let attempt = try #require(state.beginCaptureAttempt(property: property, room: .living))
+        defer { CaptureBundleStore.delete(clientCaptureID: attempt.id) }
+        let frames = try Self.writeScene(.full9, clientCaptureID: attempt.id)
+        var manifest = Self.manifest(frames: frames, clientCaptureID: attempt.id, profile: .full9)
+        manifest.state = .localReady
+        let capture = state.registerCapture(
+            attempt: attempt, property: property, room: .living, frameCount: 9,
+            localFile: manifest.referenceFrame?.localPhotoFile, manifest: manifest
+        )
+        state.endCaptureSequence()
+
+        var live = capture
+        for _ in 0..<100 {
+            try await Task.sleep(for: .milliseconds(100))
+            live = try #require(state.captures.first { $0.id == capture.id })
+            if live.status != .preparing { break }
+        }
+        #expect(live.status == .error)
+        #expect(live.hdrState == .failed)
+        #expect(state.hdrJobs[capture.id]?.errorCode == "HDR_TIMEOUT")
+        // The original is still there to show and retry from.
+        #expect(live.displayFile?.fileName == manifest.referenceFrame?.fileName)
+    }
+
+    // MARK: - Fixtures
+
+    private static let width = 320
+    private static let height = 240
+
+    private static func plan(_ profile: CaptureProfile) -> BracketPlan {
+        BracketPlan(profile: profile, segments: [profile.exposureValues], reason: "")
+    }
+
+    private static func evidence(_ callbacks: Int, requests: [Int]) -> BracketAuditor.CallbackEvidence {
+        BracketAuditor.CallbackEvidence(
+            nativeRequests: requests.count,
+            framesPerRequest: requests,
+            callbacks: callbacks,
+            callbackErrors: 0,
+            indexCollisions: 0
+        )
+    }
+
+    /// Renders one exposure of a synthetic high-dynamic-range room: a radiance ramp from deep
+    /// shadow to a bright window (×64), with vertical texture so alignment has features.
+    private static func exposure(ev: Double) -> Data {
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        let size = CGSize(width: width, height: height)
+        let image = UIGraphicsImageRenderer(size: size, format: format).image { context in
+            for x in 0..<width {
+                let t = Double(x) / Double(width - 1)
+                let radiance = 0.004 * pow(64.0 / 0.004, t)
+                for band in 0..<4 {
+                    let texture = band % 2 == 0 ? 1.0 : 0.8
+                    let value = min(1, radiance * texture * pow(2, ev))
+                    let encoded = pow(value, 1 / 2.2)
+                    UIColor(white: encoded, alpha: 1).setFill()
+                    let bandHeight = CGFloat(height) / 4
+                    context.fill(CGRect(x: CGFloat(x), y: CGFloat(band) * bandHeight, width: 1, height: bandHeight))
+                }
+            }
+        }
+        return image.jpegData(compressionQuality: 0.95) ?? Data()
+    }
+
+    private static func writeScene(_ profile: CaptureProfile, clientCaptureID: UUID) throws -> [CaptureFrame] {
+        try profile.exposureValues.enumerated().map { index, ev in
+            var frame = try CaptureBundleStore.writeFrame(
+                photoData: exposure(ev: ev),
+                clientCaptureID: clientCaptureID,
+                sequenceIndex: index,
+                requestedEV: ev,
+                orientation: .portrait,
+                cameraID: "test-camera",
+                lensType: "Rear Wide"
+            )
+            frame.actualExposureBias = ev
+            frame.iso = 100
+            frame.exposureDurationSeconds = 0.01 * pow(2, ev)
+            return frame
+        }
+    }
+
+    private static func manifest(frames: [CaptureFrame], clientCaptureID: UUID, profile: CaptureProfile) -> CaptureManifest {
+        CaptureManifest(
+            captureID: nil,
+            clientCaptureID: clientCaptureID,
+            organizationID: "Test Workspace",
+            propertyID: UUID(),
+            roomID: RoomType.living.rawValue,
+            device: "iPhone14,7",
+            iOSVersion: "iOS 26.0",
+            appVersion: "1.0.0 (1)",
+            cameraID: "test-camera",
+            lensType: "Rear Wide",
+            captureProfile: profile,
+            expectedFrameCount: profile.expectedFrameCount,
+            actualFrameCount: frames.count,
+            segmentCount: 1,
+            orientation: .portrait,
+            focusLockSucceeded: .succeeded,
+            whiteBalanceLockSucceeded: .succeeded,
+            state: .localValidating,
+            startedAt: .now,
+            completedAt: nil,
+            frames: frames,
+            requestedExposureValues: profile.exposureValues
+        )
     }
 }

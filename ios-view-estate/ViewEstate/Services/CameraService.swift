@@ -28,6 +28,8 @@ struct BracketCaptureResult: Sendable {
     var bracketDurationMs: Double?
     /// Shutter tap → first frame delivered, ms.
     var tapToFirstFrameMs: Double? = nil
+    /// What AVFoundation really did: requests issued and callbacks received.
+    var callbackEvidence: BracketAuditor.CallbackEvidence = .unknown
 
     var focusLock: LockOutcome { preparation.focusLock }
     var whiteBalanceLock: LockOutcome { preparation.whiteBalanceLock }
@@ -641,6 +643,7 @@ final class CameraService {
         var firstRequestAt: Date?
         var lastFrameAt: Date?
         var failureCode: CameraError?
+        var evidence = BracketAuditor.CallbackEvidence.unknown
 
         segments: for segment in plan.segments {
             if interruptionFlag {
@@ -656,6 +659,11 @@ final class CameraService {
                 context: context
             )
 
+            evidence.nativeRequests += outcome.requestIssued ? 1 : 0
+            evidence.framesPerRequest.append(outcome.frames.count)
+            evidence.callbacks += outcome.callbacks
+            evidence.callbackErrors += outcome.callbackErrors
+            evidence.indexCollisions += outcome.indexCollisions
             frames.append(contentsOf: outcome.frames)
             persistSeconds += outcome.persistSeconds
             if firstPhotoAt == nil { firstPhotoAt = outcome.firstPhotoAt }
@@ -695,7 +703,8 @@ final class CameraService {
             bracketDurationMs: firstRequestAt.flatMap { start in
                 (lastFrameAt ?? completedAt).timeIntervalSince(start) * 1000
             },
-            tapToFirstFrameMs: firstPhotoAt.map { $0.timeIntervalSince(tapAt) * 1000 }
+            tapToFirstFrameMs: firstPhotoAt.map { $0.timeIntervalSince(tapAt) * 1000 },
+            callbackEvidence: evidence
         )
 
         if interruptionFlag { failureCode = .captureInterrupted }
@@ -858,6 +867,7 @@ final class CameraService {
                 if connection.isVideoRotationAngleSupported(rotationAngle) {
                     connection.videoRotationAngle = rotationAngle
                 }
+                delegate.markRequestIssued()
                 photoOutput.capturePhoto(with: settings, delegate: delegate)
             }
         }
@@ -1074,6 +1084,13 @@ private struct SegmentOutcome: Sendable {
     var lastPhotoAt: Date?
     /// Normalised failure. Frames already written are still reported, as evidence.
     var failure: CameraError?
+    /// The native request actually reached `capturePhoto`.
+    var requestIssued: Bool = false
+    /// Every `didFinishProcessingPhoto` callback, successful or not.
+    var callbacks: Int = 0
+    var callbackErrors: Int = 0
+    /// Callbacks that resolved to a ladder position already written.
+    var indexCollisions: Int = 0
 }
 
 /// Guarantees one capture request resolves exactly once, whether it is the camera or the
@@ -1117,6 +1134,7 @@ private nonisolated final class SequenceCaptureDelegate: NSObject, AVCapturePhot
     private var outcome = SegmentOutcome()
     private var received = 0
     private var hasFinished = false
+    private var usedIndexes: Set<Int> = []
 
     init(
         requestedEVs: [Double],
@@ -1130,18 +1148,25 @@ private nonisolated final class SequenceCaptureDelegate: NSObject, AVCapturePhot
         self.completion = completion
     }
 
+    func markRequestIssued() {
+        outcome.requestIssued = true
+    }
+
     func photoOutput(
         _ output: AVCapturePhotoOutput,
         didFinishProcessingPhoto photo: AVCapturePhoto,
         error: Error?
     ) {
         guard !hasFinished else { return }
+        outcome.callbacks += 1
 
         if error != nil {
+            outcome.callbackErrors += 1
             outcome.failure = context.isBracket ? .bracketCaptureFailed : .captureFailed
             return
         }
         guard let data = photo.fileDataRepresentation() else {
+            outcome.callbackErrors += 1
             outcome.failure = context.isBracket ? .bracketCaptureFailed : .captureFailed
             return
         }
@@ -1159,10 +1184,22 @@ private nonisolated final class SequenceCaptureDelegate: NSObject, AVCapturePhot
         // can be reconstructed deterministically even if callbacks arrive out of order.
         let bracketBias = (photo.bracketSettings as? AVCaptureAutoExposureBracketedStillImageSettings)?
             .exposureTargetBias
-        let fallbackEV = requestedEVs[min(received, max(0, requestedEVs.count - 1))]
-        let requestedEV = bracketBias.map { Double($0) } ?? fallbackEV
-        let ladderPosition = requestedEVs.firstIndex { abs($0 - requestedEV) < 0.01 } ?? received
+        // `sequenceCount` is AVFoundation's own 1-based position inside this request.
+        let reportedPosition = photo.sequenceCount >= 1 ? photo.sequenceCount - 1 : received
+        let fallbackPosition = min(reportedPosition, max(0, requestedEVs.count - 1))
+        let requestedEV = bracketBias.map { Double($0) } ?? requestedEVs[fallbackPosition]
+        let ladderPosition = requestedEVs.firstIndex { abs($0 - requestedEV) < 0.01 } ?? fallbackPosition
         let sequenceIndex = baseIndex + ladderPosition
+
+        // Two callbacks resolving to the same position would overwrite one file with another and
+        // make one real exposure disappear. That is recorded and the attempt fails — never hidden.
+        guard !usedIndexes.contains(sequenceIndex) else {
+            outcome.indexCollisions += 1
+            outcome.failure = .duplicateFrame
+            received += 1
+            return
+        }
+        usedIndexes.insert(sequenceIndex)
 
         let metadata = Self.exposureMetadata(photo)
         let timestamp = CMTimeGetSeconds(photo.timestamp)

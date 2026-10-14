@@ -14,9 +14,12 @@ struct DevFrameInspectorView: View {
     @State private var analyses: [UUID: FrameExposureAnalysis] = [:]
     @State private var rangeReport: BracketDynamicRangeReport?
     @State private var isAnalysing = true
+    /// Re-measured from disk now, in addition to the audit recorded at capture time.
+    @State private var liveAudit: BracketAudit?
 
     var body: some View {
         List {
+            auditSection
             dynamicRangeSection
             Section("Capture") {
                 row("Profile", manifest.captureProfile.devLabel)
@@ -45,9 +48,13 @@ struct DevFrameInspectorView: View {
             }
             .listRowBackground(VE.surface)
 
-            Section("Exposures") {
+            Section("Exposures · tap to open the real file") {
                 ForEach(manifest.orderedFrames) { frame in
-                    frameRow(frame)
+                    NavigationLink {
+                        DevFrameViewer(frame: frame)
+                    } label: {
+                        frameRow(frame)
+                    }
                 }
             }
             .listRowBackground(VE.surface)
@@ -58,6 +65,25 @@ struct DevFrameInspectorView: View {
         .navigationBarTitleDisplayMode(.inline)
         .preferredColorScheme(.dark)
         .task(id: manifest.clientCaptureID) { await analyse() }
+    }
+
+    /// What physically happened for this one shutter action — callbacks, files, hashes.
+    private var auditSection: some View {
+        Section("Bracket audit · real evidence") {
+            if let audit = manifest.audit {
+                BracketAuditRows(audit: audit)
+            } else {
+                Text("Captured before callback auditing existed — callbacks were not recorded.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(VE.textTertiary)
+            }
+            if let liveAudit {
+                row("Re-verified now · persisted", "\(liveAudit.persistedFiles)")
+                row("Re-verified now · checksums OK", "\(liveAudit.verifiedChecksums)")
+                row("Re-verified now · unique hashes", "\(liveAudit.uniqueHashes)")
+            }
+        }
+        .listRowBackground(VE.surface)
     }
 
     /// Does the ladder actually widen usable dynamic range? Development heuristics only.
@@ -96,6 +122,10 @@ struct DevFrameInspectorView: View {
     private func analyse() async {
         isAnalysing = true
         let frames = manifest.orderedFrames
+        let plan = BracketPlan(profile: manifest.captureProfile, segments: [manifest.requestedLadder], reason: "")
+        liveAudit = await Task.detached(priority: .utility) {
+            BracketAuditor.audit(frames: frames, plan: plan, evidence: .unknown, verifyFromDisk: true)
+        }.value
         let results = await Task.detached(priority: .utility) { () -> [UUID: FrameExposureAnalysis] in
             var output: [UUID: FrameExposureAnalysis] = [:]
             for frame in frames {
@@ -161,7 +191,7 @@ struct DevFrameInspectorView: View {
                     ))
                 }
                 detail(frame.fileName)
-                detail("sha256 \(frame.checksum.prefix(12))… · \(frame.uploadState.devLabel)")
+                detail("sha256 …\(frame.checksum.suffix(12)) · \(frame.uploadState.devLabel)")
             }
         }
         .padding(.vertical, 4)
@@ -204,6 +234,131 @@ struct DevFrameInspectorView: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
         }
+    }
+}
+
+/// The audit rows shared by the developer panel and the frame inspector.
+struct BracketAuditRows: View {
+    let audit: BracketAudit
+
+    var body: some View {
+        Group {
+            row("Verdict", audit.verdictLabel, highlight: !audit.isTruthful)
+            row("Requested exposures", "\(audit.requestedExposures)")
+            row("Native requests", "\(audit.nativeRequests) (\(audit.framesPerRequest.map(String.init).joined(separator: " + ")))")
+            row("AVCapturePhoto callbacks", "\(audit.callbacks)", highlight: audit.callbacks != audit.requestedExposures)
+            row("Callback errors", "\(audit.callbackErrors)", highlight: audit.callbackErrors > 0)
+            row("Index collisions", "\(audit.indexCollisions)", highlight: audit.indexCollisions > 0)
+            row("Files persisted", "\(audit.persistedFiles)")
+            row("Checksums verified", "\(audit.verifiedChecksums)")
+            row("Unique hashes", "\(audit.uniqueHashes)")
+            row("Real frames", "\(audit.realFrames)", highlight: audit.realFrames != audit.requestedExposures)
+            row("EV 0 frames", "\(audit.ev0Frames)", highlight: audit.ev0Frames != 1)
+            row("Distinct exposure levels", "\(audit.distinctExposureLevels)", highlight: audit.distinctExposureLevels != audit.requestedExposures)
+            row("Measured EV vs EV 0", audit.measuredRelativeEV.map { String(format: "%+.1f", $0) }.joined(separator: " "))
+            if !audit.duplicateExposurePairs.isEmpty {
+                row("Same exposure", audit.duplicateExposurePairs.joined(separator: "  "), highlight: true)
+            }
+            row("Single camera / lens", audit.singleCamera ? "YES" : "NO", highlight: !audit.singleCamera)
+            if let spread = audit.lensPositionSpread {
+                row("Focus lens spread", String(format: "%.4f", spread))
+            }
+            if let spread = audit.whiteBalanceGainSpread {
+                row("WB gain spread", String(format: "%.1f%%", spread * 100))
+            }
+            row("Validated profile", audit.validatedProfile.devLabel, highlight: audit.validatedProfile != audit.requestedProfile)
+            row("HDR-capable source", audit.supportsHDR ? "YES" : "NO", highlight: !audit.supportsHDR)
+        }
+    }
+
+    private func row(_ label: String, _ value: String, highlight: Bool = false) -> some View {
+        HStack {
+            Text(label)
+                .font(.system(size: 13))
+                .foregroundStyle(VE.textSecondary)
+            Spacer()
+            Text(value)
+                .font(.system(size: 12, weight: .medium, design: .monospaced))
+                .foregroundStyle(highlight ? VE.warning : VE.textPrimary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+    }
+}
+
+/// One real exposure, opened from its own file on disk, with its metadata.
+private struct DevFrameViewer: View {
+    let frame: CaptureFrame
+
+    @State private var image: UIImage?
+    @State private var isMissing = false
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                Color.black
+                    .aspectRatio(3 / 4, contentMode: .fit)
+                    .overlay {
+                        if let image {
+                            Image(uiImage: image)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                        } else if isMissing {
+                            Text("File not found on disk")
+                                .font(.system(size: 13, design: .monospaced))
+                                .foregroundStyle(VE.warning)
+                        } else {
+                            ProgressView().tint(VE.textTertiary)
+                        }
+                    }
+                    .clipShape(.rect(cornerRadius: 8))
+
+                Group {
+                    line("sequence index", "#\(frame.sequenceIndex)")
+                    line("requested EV", frame.evLabel)
+                    line("actual bias", frame.actualBiasDescription)
+                    line("exposure", frame.exposureDescription)
+                    line("ISO", frame.isoDescription)
+                    line("aperture", frame.apertureDescription)
+                    line("dimensions", frame.dimensionDescription)
+                    line("file size", frame.sizeDescription)
+                    line("sha256", "…" + String(frame.checksum.suffix(16)))
+                    line("file", CaptureBundleStore.path(for: frame))
+                }
+            }
+            .padding(16)
+        }
+        .background(VE.canvas)
+        .navigationTitle("EV \(frame.evLabel)")
+        .navigationBarTitleDisplayMode(.inline)
+        .preferredColorScheme(.dark)
+        .task(id: frame.id) { await load() }
+    }
+
+    private func line(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .top) {
+            Text(label)
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundStyle(VE.textTertiary)
+                .frame(width: 110, alignment: .leading)
+            Text(value)
+                .font(.system(size: 12, weight: .medium, design: .monospaced))
+                .foregroundStyle(VE.textPrimary)
+                .textSelection(.enabled)
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func load() async {
+        guard let url = CaptureBundleStore.url(for: frame) else {
+            isMissing = true
+            return
+        }
+        let loaded = await Task.detached(priority: .userInitiated) {
+            CaptureImageLoader.image(url: url, maxPixel: 2400)
+        }.value
+        image = loaded
+        isMissing = loaded == nil
     }
 }
 

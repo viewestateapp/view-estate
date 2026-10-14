@@ -62,6 +62,10 @@ enum CaptureBundleValidator {
             }
         }
 
+        // Byte-identical exposures are one photograph counted twice, never two real frames.
+        let checksums = frames.map(\.checksum)
+        guard Set(checksums).count == checksums.count else { return .duplicateFrame }
+
         return nil
     }
 }

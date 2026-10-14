@@ -5,7 +5,10 @@ enum FeatureFlags {
     /// Default camera implementation at launch. Development can switch at runtime in the
     /// developer panel, so the simulated viewfinder always stays available as a fallback.
     static let cameraNativeEnabled = true
-    static let hdrProcessingEnabled = false
+    /// `real_hdr_enabled`: real captures are merged on the device by the real HDR pipeline.
+    /// Each capture is still gated by its own bracket audit — a bracket without real, distinct
+    /// exposures is never merged.
+    static let realHDREnabled = true
     static let aiToolsEnabled = true
     static let billingEnabled = false
     static let creditPurchaseEnabled = false

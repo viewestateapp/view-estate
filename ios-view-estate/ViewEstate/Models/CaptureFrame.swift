@@ -128,7 +128,11 @@ enum CaptureSource: String, Codable, Hashable, Sendable {
 }
 
 enum HDRSource: String, Codable, Hashable, Sendable {
+    /// No real HDR file exists or will be produced.
     case mock = "MOCK"
+    /// The real pipeline owns this capture and is working on it.
+    case realProcessing = "REAL_PROCESSING"
+    /// A real, verified HDR master file exists on the device.
     case real = "REAL"
 
     var devLabel: String { rawValue }
@@ -196,6 +200,8 @@ struct CaptureManifest: Codable, Hashable, Sendable, Identifiable {
     var quality: CaptureQualityReport? = nil
     /// Present only on development QA captures; untagged bundles are never exported.
     var qaTag: CameraQATag? = nil
+    /// Real callbacks, files and hashes behind this attempt. `nil` on earlier manifests.
+    var audit: BracketAudit? = nil
 
     var id: UUID { clientCaptureID }
 

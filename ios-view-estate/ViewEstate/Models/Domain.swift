@@ -180,8 +180,18 @@ struct CaptureItem: Identifiable, Hashable, Sendable {
     /// Complete local record of the real bracket behind this capture: every exposure, its
     /// metadata and its checksum. Absent for simulated captures.
     var manifest: CaptureManifest?
+    /// Where the HDR master stands. `mock` means no real HDR file exists.
+    var hdrState: HDRState = .mock
+    /// The real, verified HDR master. Only set once its file exists and reads back intact.
+    var hdrMaster: HDRMasterRecord?
 
     var status: PreparationStatus { jobState.userFacing }
+
+    /// What the gallery and photo detail show: the real HDR master once it exists, the EV 0
+    /// reference exposure until then. The user never loses access to the photograph.
+    var displayFile: LocalPhotoFile? {
+        hdrMaster?.masterFile ?? localFile
+    }
 
     /// A capture whose original bytes already live on this device.
     var hasLocalOriginal: Bool { localFile != nil }
@@ -189,8 +199,15 @@ struct CaptureItem: Identifiable, Hashable, Sendable {
     /// Real photographs from the native camera, as opposed to the simulated prototype.
     var captureSource: CaptureSource { manifest?.captureSource ?? .simulated }
 
-    /// The HDR master is still simulated in this phase, whatever the pixels came from.
-    var hdrSource: HDRSource { manifest?.hdrSource ?? .mock }
+    /// REAL only when a verified master file exists; REAL_PROCESSING while the real pipeline
+    /// owns the capture; MOCK otherwise.
+    var hdrSource: HDRSource {
+        switch hdrState {
+        case .generated: hdrMaster == nil ? .mock : .real
+        case .pending, .processing: .realProcessing
+        case .mock, .failed, .sourceRejected: .mock
+        }
+    }
 
     /// Every real exposure of this capture, in ladder order.
     var frames: [CaptureFrame] { manifest?.orderedFrames ?? [] }

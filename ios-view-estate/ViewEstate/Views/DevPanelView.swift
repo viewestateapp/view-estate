@@ -170,6 +170,9 @@ struct DevPanelView: View {
                         if let failureCode = manifest.failureCode {
                             debugRow("Failure", failureCode)
                         }
+                        if let audit = manifest.audit {
+                            BracketAuditRows(audit: audit)
+                        }
                         NavigationLink {
                             DevFrameInspectorView(manifest: manifest)
                         } label: {
@@ -209,7 +212,29 @@ struct DevPanelView: View {
                         debugRow("Frames", "\(capture.frameCount)")
                         debugRow("Processing State", capture.jobState.rawValue)
                         debugRow("User Status", state.t(capture.status.localizationKey))
-                        debugRow("Asset State", capture.assets.map(\.type.rawValue).joined(separator: " → "))
+                        debugRow("Original", capture.captureSource == .nativeReal ? "REAL" : "SIMULATED")
+                        debugRow("HDR", capture.hdrState.devLabel)
+                        debugRow("Asset State", assetStateDescription(capture))
+                        if let job = state.hdrJobs[capture.id] {
+                            debugRow("HDR job stage", job.stage.rawValue)
+                            debugRow("jobStartedAt", job.jobStartedAt.formatted(date: .omitted, time: .standard))
+                            debugRow("elapsedTime", String(format: "%.1f s", job.elapsedSeconds))
+                            debugRow("lastProgressAt", job.lastProgressAt.formatted(date: .omitted, time: .standard))
+                            debugRow("errorCode", job.errorCode ?? "—")
+                        }
+                        if let master = capture.hdrMaster {
+                            debugRow("HDR asset ID", String(master.assetID.uuidString.prefix(8)))
+                            debugRow("HDR file", HDRMasterStore.path(master))
+                            debugRow("HDR size", master.sizeDescription)
+                            debugRow("HDR dimensions", master.dimensionDescription)
+                            debugRow("HDR sha256", "…" + String(master.checksum.suffix(12)))
+                            debugRow("HDR pipeline", master.pipelineVersion)
+                            debugRow("HDR sources", "\(master.sourceFrameCount) frames · \(master.distinctExposureLevels) levels")
+                            debugRow("Time to HDR", String(format: "%.1f s", master.processingSeconds))
+                            debugRow("EV0 clip H / S", String(format: "%.2f%% / %.2f%%", master.ev0HighlightClipPercent, master.ev0ShadowClipPercent))
+                            debugRow("HDR clip H / S", String(format: "%.2f%% / %.2f%%", master.hdrHighlightClipPercent, master.hdrShadowClipPercent))
+                            debugRow("EV0 vs HDR range", master.dynamicRangeVerdict)
+                        }
                         debugRow("Local Original", capture.hasLocalOriginal ? "true" : "false")
                         if let file = capture.localFile {
                             debugRow("Local file", file.fileName)
@@ -350,7 +375,12 @@ struct DevPanelView: View {
 
                 Section("Feature flags") {
                     flag("camera_native_enabled", state.cameraMode.isNative)
-                    flag("hdr_processing_enabled", FeatureFlags.hdrProcessingEnabled)
+                    Toggle(isOn: realHDRBinding) {
+                        Text("real_hdr_enabled")
+                            .font(.system(size: 13, design: .monospaced))
+                            .foregroundStyle(VE.textSecondary)
+                    }
+                    .tint(VE.success)
                     flag("ai_tools_enabled", FeatureFlags.aiToolsEnabled)
                     flag("billing_enabled", FeatureFlags.billingEnabled)
                     flag("credit_purchase_enabled", FeatureFlags.creditPurchaseEnabled)
@@ -401,6 +431,20 @@ struct DevPanelView: View {
         return String(format: "%.2f s", value)
     }
 
+    /// Lineage as it physically exists: an HDR master is only listed when its file does.
+    private func assetStateDescription(_ capture: CaptureItem) -> String {
+        let original = capture.captureSource == .nativeReal ? "original (REAL)" : "original (SIMULATED)"
+        let hdr: String
+        switch capture.hdrState {
+        case .generated where capture.hdrMaster != nil: hdr = "hdrMaster (REAL file)"
+        case .pending, .processing: hdr = "hdrMaster (PROCESSING)"
+        case .failed: hdr = "hdrMaster (FAILED)"
+        case .sourceRejected: hdr = "hdrMaster (SOURCE_REJECTED)"
+        default: hdr = "HDR MOCK / NOT GENERATED"
+        }
+        return "\(original) → \(hdr)"
+    }
+
     // MARK: - Bindings
 
     private var cameraModeBinding: Binding<CameraMode> {
@@ -439,6 +483,10 @@ struct DevPanelView: View {
 
     private var onlineBinding: Binding<Bool> {
         Binding(get: { state.isOnline }, set: { state.setOnline($0) })
+    }
+
+    private var realHDRBinding: Binding<Bool> {
+        Binding(get: { state.realHDREnabled }, set: { state.realHDREnabled = $0 })
     }
 
     private var syncBinding: Binding<SyncState> {
@@ -522,7 +570,7 @@ private struct DevScreenHost: View {
             jobState: jobState,
             createdAt: createdAt,
             isFavorite: false,
-            assets: MockData.lineage(frameCount: 9, createdAt: createdAt, includeMaster: jobState == .ready),
+            assets: MockData.lineage(frameCount: 9, createdAt: createdAt, includeMaster: false),
             isPendingSync: screen == .offlineCapture
         )
     }

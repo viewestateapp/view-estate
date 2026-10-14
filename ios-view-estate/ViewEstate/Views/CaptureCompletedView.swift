@@ -12,6 +12,12 @@ struct CaptureCompletedView: View {
 
     @Environment(AppState.self) private var state
     @State private var appeared = false
+    @State private var showDetail = false
+
+    /// The live capture, so the card follows A preparar → Pronta and swaps to the HDR master.
+    private var liveCapture: CaptureItem {
+        state.captures.first { $0.id == capture.id } ?? capture
+    }
 
     var body: some View {
         ZStack(alignment: .top) {
@@ -66,6 +72,9 @@ struct CaptureCompletedView: View {
         .onAppear {
             withAnimation(.spring(response: 0.5, dampingFraction: 0.85)) { appeared = true }
         }
+        .sheet(isPresented: $showDetail) {
+            PhotoDetailView(captureID: capture.id, onCapture: nil)
+        }
     }
 
     private var confirmation: some View {
@@ -96,32 +105,40 @@ struct CaptureCompletedView: View {
         .padding(.horizontal, VE.Space.l)
     }
 
+    /// Tapping the photograph opens it, whatever its preparation state.
     private var capturedCard: some View {
-        VStack(spacing: 0) {
-            Color(VE.elevated)
-                .frame(height: 180)
-                .overlay {
-                    CaptureImage(capture: capture)
-                        .allowsHitTesting(false)
-                }
-                .clipped()
+        Button {
+            showDetail = true
+        } label: {
+            VStack(spacing: 0) {
+                Color(VE.elevated)
+                    .frame(height: 180)
+                    .overlay {
+                        CaptureImage(capture: liveCapture)
+                            .allowsHitTesting(false)
+                    }
+                    .clipped()
 
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(state.roomName(capture.room))
-                        .font(VE.Font.cardTitle)
-                        .foregroundStyle(VE.textPrimary)
-                    Text(property.title)
-                        .font(VE.Font.caption)
-                        .foregroundStyle(VE.ai)
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(state.roomName(capture.room))
+                            .font(VE.Font.cardTitle)
+                            .foregroundStyle(VE.textPrimary)
+                        Text(property.title)
+                            .font(VE.Font.caption)
+                            .foregroundStyle(VE.ai)
+                    }
+                    Spacer()
+                    StatusBadge(status: liveCapture.status)
                 }
-                Spacer()
-                StatusBadge(status: capture.status)
+                .padding(VE.Space.m)
             }
-            .padding(VE.Space.m)
+            .veCard()
+            .clipShape(.rect(cornerRadius: VE.Radius.card))
+            .contentShape(.rect(cornerRadius: VE.Radius.card))
         }
-        .veCard()
-        .clipShape(.rect(cornerRadius: VE.Radius.card))
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("capture.done.photo")
     }
 
     private var pendingSyncHint: some View {
