@@ -4,6 +4,7 @@
 //
 
 import Foundation
+import ImageIO
 import Testing
 import UIKit
 @testable import ViewEstate
@@ -1932,6 +1933,247 @@ struct RealHDRPipelineTests {
             completedAt: nil,
             frames: frames,
             requestedExposureValues: profile.exposureValues
+        )
+    }
+}
+
+/// Capture → preview → gallery flow and camera orientation.
+///
+/// Physical rotation, the live preview and the saved files are verified on the iPhone; these
+/// tests lock the rules underneath: hysteresis and freezing of orientation, one orientation per
+/// capture, real pixels only for real captures, and the viewer's swipe order.
+@MainActor
+@Suite(.serialized)
+struct PhotoReviewAndOrientationTests {
+
+    // MARK: - Orientation
+
+    private static func gravity(degrees: Double) -> (x: Double, y: Double) {
+        // `horizon` is atan2(gx, -gy): 0 upright, −90 top-left, +90 top-right.
+        let radians = degrees * .pi / 180
+        return (sin(radians), -cos(radians))
+    }
+
+    @Test func detectsTheThreeShootingOrientations() {
+        let upright = Self.gravity(degrees: 5)
+        let topLeft = Self.gravity(degrees: -88)
+        let topRight = Self.gravity(degrees: 92)
+        #expect(OrientationTracker.detect(gravityX: upright.x, gravityY: upright.y) == .portrait)
+        #expect(OrientationTracker.detect(gravityX: topLeft.x, gravityY: topLeft.y) == .landscapeRight)
+        #expect(OrientationTracker.detect(gravityX: topRight.x, gravityY: topRight.y) == .landscapeLeft)
+        // Capture angles agree with the back camera: landscapeRight = 0°, landscapeLeft = 180°.
+        #expect(CaptureOrientation.landscapeRight.videoRotationAngle == 0)
+        #expect(CaptureOrientation.landscapeLeft.videoRotationAngle == 180)
+        #expect(CaptureOrientation.portrait.videoRotationAngle == 90)
+    }
+
+    // Near the diagonal, flat on a table, or upside down: nothing changes.
+    @Test func ambiguousFlatAndUpsideDownKeepTheLastOrientation() {
+        let diagonal = Self.gravity(degrees: -50)
+        #expect(OrientationTracker.detect(gravityX: diagonal.x, gravityY: diagonal.y) == nil)
+        #expect(OrientationTracker.detect(gravityX: 0.05, gravityY: -0.1) == nil) // face up
+        let upsideDown = Self.gravity(degrees: 178)
+        #expect(OrientationTracker.detect(gravityX: upsideDown.x, gravityY: upsideDown.y) == nil)
+
+        var tracker = OrientationTracker()
+        let landscape = Self.gravity(degrees: -90)
+        tracker.ingest(gravityX: landscape.x, gravityY: landscape.y, timestamp: 0)
+        tracker.ingest(gravityX: landscape.x, gravityY: landscape.y, timestamp: 0.3)
+        #expect(tracker.orientation == .landscapeRight)
+        tracker.ingest(gravityX: 0.02, gravityY: -0.05, timestamp: 0.6)
+        tracker.ingest(gravityX: 0.02, gravityY: -0.05, timestamp: 2.0)
+        #expect(tracker.orientation == .landscapeRight)
+    }
+
+    // A brief wobble shorter than the debounce never flips the interface.
+    @Test func debounceIgnoresBriefWobbles() {
+        var tracker = OrientationTracker()
+        let landscape = Self.gravity(degrees: -90)
+        let upright = Self.gravity(degrees: 0)
+        tracker.ingest(gravityX: landscape.x, gravityY: landscape.y, timestamp: 0)
+        tracker.ingest(gravityX: landscape.x, gravityY: landscape.y, timestamp: 0.1)
+        tracker.ingest(gravityX: upright.x, gravityY: upright.y, timestamp: 0.15)
+        tracker.ingest(gravityX: upright.x, gravityY: upright.y, timestamp: 0.3)
+        #expect(tracker.orientation == .portrait)
+    }
+
+    // Rotating during a bracket changes nothing until the bracket is released.
+    @Test func orientationIsFrozenDuringTheBracket() {
+        var tracker = OrientationTracker()
+        let landscape = Self.gravity(degrees: 90)
+        tracker.ingest(gravityX: landscape.x, gravityY: landscape.y, timestamp: 0)
+        tracker.ingest(gravityX: landscape.x, gravityY: landscape.y, timestamp: 0.3)
+        #expect(tracker.orientation == .landscapeLeft)
+
+        tracker.freeze()
+        let upright = Self.gravity(degrees: 0)
+        for step in 0..<20 {
+            tracker.ingest(gravityX: upright.x, gravityY: upright.y, timestamp: 0.4 + Double(step) * 0.1)
+        }
+        #expect(tracker.orientation == .landscapeLeft)
+
+        tracker.release()
+        #expect(tracker.orientation == .portrait)
+    }
+
+    // Frames that disagree on EXIF orientation are ORIENTATION_INCONSISTENT and never merged.
+    @Test func inconsistentFrameOrientationIsRejected() throws {
+        let id = UUID()
+        defer { CaptureBundleStore.delete(clientCaptureID: id) }
+        var frames: [CaptureFrame] = try CaptureProfile.basic3.exposureValues.enumerated().map { index, ev in
+            try CaptureBundleStore.writeFrame(
+                photoData: Self.jpeg(width: 64, height: 48, white: 0.2 + Double(index) * 0.3),
+                clientCaptureID: id, sequenceIndex: index, requestedEV: ev,
+                orientation: .landscapeRight, cameraID: "test-camera", lensType: "Rear Wide"
+            )
+        }
+        frames[2].exifOrientation = 6
+        var manifest = Self.manifest(frames: frames, clientCaptureID: id, orientation: .landscapeRight)
+        #expect(CaptureBundleValidator.validate(manifest) == .frameOrientationMismatch)
+        #expect(CameraError.frameOrientationMismatch.code == "ORIENTATION_INCONSISTENT")
+
+        manifest.state = .localReady
+        let result = HDRProcessingService.process(manifest: manifest, captureID: UUID()) { _ in }
+        guard case .failure(let failure) = result else {
+            Issue.record("Inconsistent orientation must never be merged")
+            return
+        }
+        #expect(failure.code == "ORIENTATION_INCONSISTENT")
+        #expect(failure.kind == .sourceRejected)
+    }
+
+    // MARK: - Display asset
+
+    // A real capture shows its real EV 0 while preparing and the real HDR master when ready.
+    // It never resolves to mock content.
+    @Test func realCaptureNeverResolvesToMock() throws {
+        let state = AppState()
+        state.realHDREnabled = false
+        let property = try #require(state.properties.first)
+        let attempt = try #require(state.beginCaptureAttempt(property: property, room: .living))
+        let file = try CaptureFileStore.saveOriginal(
+            photoData: Self.jpeg(width: 400, height: 300, white: 0.5),
+            clientCaptureID: attempt.id,
+            orientation: .landscapeRight
+        )
+        defer {
+            if let url = CaptureFileStore.url(for: file) { try? FileManager.default.removeItem(at: url) }
+        }
+        let capture = state.registerCapture(attempt: attempt, property: property, room: .living, frameCount: 1, localFile: file)
+        state.endCaptureSequence()
+
+        for size in [640, 1600, 2400] {
+            let asset = DisplayAssetResolver.resolve(capture, maxPixel: size)
+            #expect(asset.type == .ev0Preview)
+            #expect(asset.source == .nativeReal)
+            #expect(asset.url != nil)
+            #expect(DisplayAssetResolver.violation(capture: capture, asset: asset) == nil)
+        }
+
+        // A real capture whose file is gone is MISSING — never a placeholder.
+        var broken = capture
+        broken.localFile?.fileName = "does-not-exist.jpg"
+        broken.manifest = nil
+        let asset = DisplayAssetResolver.resolve(broken, maxPixel: 640)
+        #expect(asset.source != .mock)
+        #expect(asset.placeholderName == nil)
+
+        // Mock imagery is reserved for simulated captures; the assertion fires otherwise.
+        let forcedMock = DisplayedAsset(type: .mockPlaceholder, source: .mock, placeholderName: "x")
+        #expect(DisplayAssetResolver.violation(capture: capture, asset: forcedMock) == "REAL_CAPTURE_RENDERED_WITH_MOCK_ASSET")
+    }
+
+    @Test func simulatedCaptureUsesItsReferenceImage() throws {
+        let state = AppState()
+        let property = try #require(state.properties.first)
+        let attempt = try #require(state.beginCaptureAttempt(property: property, room: .kitchen))
+        let capture = state.registerCapture(attempt: attempt, property: property, room: .kitchen, frameCount: 9)
+        state.endCaptureSequence()
+        let asset = DisplayAssetResolver.resolve(capture, maxPixel: 640)
+        #expect(asset.source == .mock)
+        #expect(DisplayAssetResolver.violation(capture: capture, asset: asset) == nil)
+    }
+
+    // The EV 0 display preview is upright, display-sized and leaves the original untouched.
+    @Test func referencePreviewIsUprightAndOriginalUntouched() throws {
+        let id = UUID()
+        defer { CaptureBundleStore.delete(clientCaptureID: id) }
+        let frame = try CaptureBundleStore.writeFrame(
+            photoData: Self.jpeg(width: 3200, height: 2400, white: 0.6),
+            clientCaptureID: id, sequenceIndex: 0, requestedEV: 0,
+            orientation: .landscapeRight, cameraID: "test-camera", lensType: "Rear Wide"
+        )
+        let source = try #require(CaptureBundleStore.url(for: frame))
+        let before = try Data(contentsOf: source)
+
+        let name = try #require(ReferencePreviewService.generate(clientCaptureID: id, source: source))
+        let url = try #require(CaptureBundleStore.url(clientCaptureID: id, fileName: name))
+        let imageSource = try #require(CGImageSourceCreateWithURL(url as CFURL, nil))
+        let properties = try #require(CGImageSourceCopyPropertiesAtIndex(imageSource, 0, nil) as? [CFString: Any])
+        let width = try #require(properties[kCGImagePropertyPixelWidth] as? Int)
+        let height = try #require(properties[kCGImagePropertyPixelHeight] as? Int)
+        #expect(max(width, height) == ReferencePreviewService.maxPixel)
+        #expect(width > height) // landscape stays landscape
+        #expect((properties[kCGImagePropertyOrientation] as? Int ?? 1) == 1)
+        #expect(try Data(contentsOf: source) == before)
+    }
+
+    // MARK: - Viewer sequence
+
+    // Swipe order: same property and room only, in shooting order.
+    @Test func viewerSwipesWithinPropertyAndRoomInShootingOrder() throws {
+        let state = AppState()
+        let property = try #require(state.properties.first)
+        var ids: [UUID] = []
+        for room in [RoomType.living, .kitchen, .living, .living] {
+            let attempt = try #require(state.beginCaptureAttempt(property: property, room: room))
+            let capture = state.registerCapture(attempt: attempt, property: property, room: room, frameCount: 9)
+            state.endCaptureSequence()
+            if room == .living { ids.append(capture.id) }
+        }
+        let sequence = state.reviewSequence(propertyID: property.id, room: .living).map(\.id)
+        #expect(Array(sequence.suffix(3)) == ids)
+        #expect(!sequence.contains { id in state.captures.first { $0.id == id }?.room == .kitchen })
+    }
+
+    // MARK: - Fixtures
+
+    private static func jpeg(width: Int, height: Int, white: Double) -> Data {
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        let size = CGSize(width: width, height: height)
+        return UIGraphicsImageRenderer(size: size, format: format).image { context in
+            UIColor(white: white, alpha: 1).setFill()
+            context.fill(CGRect(origin: .zero, size: size))
+            UIColor.black.setFill()
+            context.fill(CGRect(x: 0, y: 0, width: width / 4, height: height / 4))
+        }.jpegData(compressionQuality: 0.9) ?? Data()
+    }
+
+    private static func manifest(frames: [CaptureFrame], clientCaptureID: UUID, orientation: CaptureOrientation) -> CaptureManifest {
+        CaptureManifest(
+            captureID: nil,
+            clientCaptureID: clientCaptureID,
+            organizationID: "Test Workspace",
+            propertyID: UUID(),
+            roomID: RoomType.living.rawValue,
+            device: "iPhone14,7",
+            iOSVersion: "iOS 26.0",
+            appVersion: "1.0.0 (1)",
+            cameraID: "test-camera",
+            lensType: "Rear Wide",
+            captureProfile: .basic3,
+            expectedFrameCount: 3,
+            actualFrameCount: frames.count,
+            segmentCount: 1,
+            orientation: orientation,
+            focusLockSucceeded: .succeeded,
+            whiteBalanceLockSucceeded: .succeeded,
+            state: .localValidating,
+            startedAt: .now,
+            completedAt: nil,
+            frames: frames,
+            requestedExposureValues: CaptureProfile.basic3.exposureValues
         )
     }
 }

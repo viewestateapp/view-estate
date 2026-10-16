@@ -159,6 +159,21 @@ enum Strings {
         "camera.tool.room": "Mudar de divisão",
         "camera.tool.gallery": "Abrir galeria",
         "camera.lens": "Objetiva",
+        "camera.feedback.captured": "Capturada",
+        "camera.queue": "%d a preparar",
+        "camera.room.finish": "Concluir divisão",
+        "camera.tool.lastPhoto": "Abrir última fotografia",
+
+        // Room review
+        "review.photos": "%d fotografias",
+        "review.continue": "Continuar nesta divisão",
+        "review.nextRoom": "Próxima divisão",
+        "review.finish": "Terminar",
+        "review.empty": "Ainda sem fotografias nesta divisão.",
+
+        // Photo viewer
+        "viewer.info": "Informações e versões",
+        "viewer.more": "Mais",
 
         // Capture setup
         "capture.pick.property": "Selecionar imóvel",
@@ -440,6 +455,19 @@ enum Strings {
         "camera.tool.room": "Trocar de cômodo",
         "camera.tool.gallery": "Abrir galeria",
         "camera.lens": "Lente",
+        "camera.feedback.captured": "Capturada",
+        "camera.queue": "%d preparando",
+        "camera.room.finish": "Concluir cômodo",
+        "camera.tool.lastPhoto": "Abrir última foto",
+
+        "review.photos": "%d fotos",
+        "review.continue": "Continuar neste cômodo",
+        "review.nextRoom": "Próximo cômodo",
+        "review.finish": "Terminar",
+        "review.empty": "Ainda sem fotos neste cômodo.",
+
+        "viewer.info": "Informações e versões",
+        "viewer.more": "Mais",
 
         "capture.pick.property": "Selecionar imóvel",
         "capture.pick.room": "Selecionar cômodo",

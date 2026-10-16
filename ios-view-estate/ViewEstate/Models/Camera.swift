@@ -50,7 +50,7 @@ enum CameraError: String, Error, Sendable, CaseIterable {
     case frameMissing = "FRAME_MISSING"
     case frameSaveFailed = "FRAME_SAVE_FAILED"
     case frameDimensionMismatch = "FRAME_DIMENSION_MISMATCH"
-    case frameOrientationMismatch = "FRAME_ORIENTATION_MISMATCH"
+    case frameOrientationMismatch = "ORIENTATION_INCONSISTENT"
     case cameraChanged = "CAMERA_CHANGED"
     case captureInterrupted = "CAPTURE_INTERRUPTED"
     case ev0Missing = "EV0_MISSING"

@@ -12,7 +12,7 @@ struct CaptureCompletedView: View {
 
     @Environment(AppState.self) private var state
     @State private var appeared = false
-    @State private var showDetail = false
+    @State private var viewerRoute: PhotoViewerRoute?
 
     /// The live capture, so the card follows A preparar → Pronta and swaps to the HDR master.
     private var liveCapture: CaptureItem {
@@ -72,9 +72,7 @@ struct CaptureCompletedView: View {
         .onAppear {
             withAnimation(.spring(response: 0.5, dampingFraction: 0.85)) { appeared = true }
         }
-        .sheet(isPresented: $showDetail) {
-            PhotoDetailView(captureID: capture.id, onCapture: nil)
-        }
+        .photoViewer($viewerRoute)
     }
 
     private var confirmation: some View {
@@ -108,7 +106,7 @@ struct CaptureCompletedView: View {
     /// Tapping the photograph opens it, whatever its preparation state.
     private var capturedCard: some View {
         Button {
-            showDetail = true
+            viewerRoute = PhotoViewerRoute(captureID: capture.id)
         } label: {
             VStack(spacing: 0) {
                 Color(VE.elevated)

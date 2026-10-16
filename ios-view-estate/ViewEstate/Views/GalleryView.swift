@@ -7,7 +7,7 @@ struct GalleryView: View {
     @Environment(AppState.self) private var state
 
     @State private var roomFilter: RoomType?
-    @State private var selected: CaptureItem?
+    @State private var viewerRoute: PhotoViewerRoute?
 
     private var filtered: [CaptureItem] {
         guard let roomFilter else { return state.captures }
@@ -31,15 +31,8 @@ struct GalleryView: View {
                     if filtered.isEmpty {
                         emptyState
                     } else {
-                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 104), spacing: 12)], spacing: 18) {
-                            ForEach(filtered) { capture in
-                                Button {
-                                    selected = capture
-                                } label: {
-                                    CaptureThumbnail(capture: capture, size: 104)
-                                }
-                                .buttonStyle(.plain)
-                            }
+                        PhotoGrid(captures: filtered, showsRoom: roomFilter == nil) { capture in
+                            viewerRoute = PhotoViewerRoute(captureID: capture.id)
                         }
                     }
                 }
@@ -49,10 +42,13 @@ struct GalleryView: View {
             .background(VE.canvas)
             .scrollIndicators(.hidden)
             .navigationTitle(state.t("gallery.title"))
-            .sheet(item: $selected) { capture in
-                PhotoDetailView(captureID: capture.id, onCapture: onCapture)
-            }
+            .photoViewer($viewerRoute, onRecapture: recaptureHandler)
         }
+    }
+
+    private var recaptureHandler: ((Property, RoomType) -> Void)? {
+        guard let onCapture else { return nil }
+        return { property, room in onCapture(property, room) }
     }
 
     private var filterRow: some View {

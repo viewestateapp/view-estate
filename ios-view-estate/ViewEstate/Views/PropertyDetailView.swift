@@ -6,7 +6,7 @@ struct PropertyDetailView: View {
     let onCapture: (Property?, RoomType?) -> Void
 
     @Environment(AppState.self) private var state
-    @State private var selected: CaptureItem?
+    @State private var viewerRoute: PhotoViewerRoute?
 
     private var captures: [CaptureItem] {
         state.captures(for: property.id)
@@ -22,15 +22,13 @@ struct PropertyDetailView: View {
             VStack(alignment: .leading, spacing: VE.Space.l) {
                 hero
                 overview
-                rooms
                 photos
+                rooms
                 lineage
             }
             .padding(.bottom, 120)
         }
-        .sheet(item: $selected) { capture in
-            PhotoDetailView(captureID: capture.id, onCapture: onCapture)
-        }
+        .photoViewer($viewerRoute) { property, room in onCapture(property, room) }
         .background(VE.canvas)
         .scrollIndicators(.hidden)
         .navigationTitle(property.title)
@@ -144,8 +142,10 @@ struct PropertyDetailView: View {
         }
     }
 
+    /// The property's main review surface: every photograph, grouped by room, newest first.
+    /// Each tile opens the viewer in any state.
     private var photos: some View {
-        VStack(alignment: .leading, spacing: VE.Space.s) {
+        VStack(alignment: .leading, spacing: VE.Space.m) {
             SectionHeader(title: state.t("properties.detail.gallery"))
                 .padding(.horizontal, VE.Space.m)
 
@@ -156,19 +156,34 @@ struct PropertyDetailView: View {
                     .padding(.horizontal, VE.Space.m)
                     .padding(.vertical, 30)
             } else {
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 104), spacing: 12)], spacing: 16) {
-                    ForEach(captures) { capture in
-                        Button {
-                            selected = capture
-                        } label: {
-                            CaptureThumbnail(capture: capture, size: 104)
+                ForEach(roomsWithPhotos) { room in
+                    let roomCaptures = captures.filter { $0.room == room }
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 6) {
+                            Text(state.roomName(room))
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundStyle(VE.textPrimary)
+                            Text("\(roomCaptures.count)")
+                                .font(.system(size: 13, weight: .medium).monospacedDigit())
+                                .foregroundStyle(VE.textTertiary)
                         }
-                        .buttonStyle(.plain)
+                        PhotoGrid(captures: roomCaptures) { capture in
+                            viewerRoute = PhotoViewerRoute(captureID: capture.id)
+                        }
                     }
+                    .padding(.horizontal, VE.Space.m)
                 }
-                .padding(.horizontal, VE.Space.m)
             }
         }
+    }
+
+    /// Rooms in the order their most recent photo was taken.
+    private var roomsWithPhotos: [RoomType] {
+        var seen: [RoomType] = []
+        for capture in captures where !seen.contains(capture.room) {
+            seen.append(capture.room)
+        }
+        return seen
     }
 
     @ViewBuilder

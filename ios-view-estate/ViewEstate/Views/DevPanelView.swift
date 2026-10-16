@@ -251,6 +251,40 @@ struct DevPanelView: View {
                 }
                 .listRowBackground(VE.surface)
 
+                Section("Photo review — mock check") {
+                    Toggle(isOn: summaryScreenBinding) {
+                        Text("Capture summary screen after each photo")
+                            .font(.system(size: 13))
+                            .foregroundStyle(VE.textSecondary)
+                    }
+                    .tint(VE.copper)
+                    debugRow(
+                        "Media issues",
+                        state.mediaIssues.isEmpty ? "0 · PASS" : "\(state.mediaIssues.count) · FAIL"
+                    )
+                    ForEach(state.mediaIssues) { issue in
+                        debugRow(String(issue.captureID.uuidString.prefix(8)), issue.code)
+                    }
+                    ForEach(state.captures.prefix(6)) { capture in
+                        let viewer = DisplayAssetResolver.resolve(capture, maxPixel: ReferencePreviewService.maxPixel)
+                        let violation = DisplayAssetResolver.violation(capture: capture, asset: viewer)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("\(capture.shortID) · \(state.roomName(capture.room)) · \(state.t(capture.status.localizationKey))")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(VE.textPrimary)
+                            Text("captureSource \(capture.captureSource.devLabel)")
+                            Text("displayedAssetType \(viewer.type.rawValue)")
+                            Text("displayedAssetSource \(viewer.source.rawValue)")
+                            Text("orientation \(capture.manifest?.orientation.devLabel ?? "—") · EV0 preview \(capture.referencePreviewFileName == nil ? "pending" : "ready")")
+                            Text(violation ?? "mock check PASS")
+                                .foregroundStyle(violation == nil ? VE.success : VE.danger)
+                        }
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(VE.textSecondary)
+                    }
+                }
+                .listRowBackground(VE.surface)
+
                 Section("Development properties") {
                     if developmentProperties.isEmpty {
                         Text("No development property registered.")
@@ -494,6 +528,13 @@ struct DevPanelView: View {
     }
 
     // MARK: - Helpers
+
+    private var summaryScreenBinding: Binding<Bool> {
+        Binding(
+            get: { state.captureSummaryScreenEnabled },
+            set: { state.captureSummaryScreenEnabled = $0 }
+        )
+    }
 
     private func debugRow(_ label: String, _ value: String) -> some View {
         HStack {

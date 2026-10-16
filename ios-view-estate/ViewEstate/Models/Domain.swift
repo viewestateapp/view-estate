@@ -184,6 +184,8 @@ struct CaptureItem: Identifiable, Hashable, Sendable {
     var hdrState: HDRState = .mock
     /// The real, verified HDR master. Only set once its file exists and reads back intact.
     var hdrMaster: HDRMasterRecord?
+    /// Display-sized EV 0 preview inside the capture bundle, once generated.
+    var referencePreviewFileName: String?
 
     var status: PreparationStatus { jobState.userFacing }
 

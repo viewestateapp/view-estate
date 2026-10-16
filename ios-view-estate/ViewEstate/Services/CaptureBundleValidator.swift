@@ -49,7 +49,10 @@ enum CaptureBundleValidator {
             guard frame.width == first.width, frame.height == first.height else {
                 return .frameDimensionMismatch
             }
-            guard frame.orientation == first.orientation, frame.orientation == manifest.orientation else {
+            // One logical orientation AND one physical EXIF orientation for every exposure.
+            guard frame.orientation == first.orientation, frame.orientation == manifest.orientation,
+                  frame.exifOrientation == first.exifOrientation
+            else {
                 return .frameOrientationMismatch
             }
             guard frame.cameraID == first.cameraID, frame.lensType == first.lensType,

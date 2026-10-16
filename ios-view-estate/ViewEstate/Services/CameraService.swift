@@ -573,11 +573,15 @@ final class CameraService {
     /// - Parameters:
     ///   - tapAt: when the shutter was tapped, for tap-to-capture latency.
     ///   - availableBytesOverride: development-only low-storage simulation.
+    ///   - orientation: the physical orientation frozen by the camera interface at the tap. The
+    ///     camera UI, the saved frames and the manifest then share one orientation. `nil` falls
+    ///     back to the rotation coordinator (no motion sensor available).
     /// - Throws: `BracketCaptureFailure` carrying a normalised code and whatever was persisted.
     func captureBracket(
         clientCaptureID: UUID,
         tapAt: Date = .now,
-        availableBytesOverride: Int64? = nil
+        availableBytesOverride: Int64? = nil,
+        orientation frozenOrientation: CaptureOrientation? = nil
     ) async throws -> BracketCaptureResult {
         guard access.isAuthorized else {
             throw BracketCaptureFailure(code: .permissionDenied, partial: emptyResult(clientCaptureID))
@@ -604,7 +608,7 @@ final class CameraService {
         let startedAt = Date()
         // Orientation is frozen at the top of the attempt: rotating the phone mid-bracket never
         // gives individual frames different orientations.
-        let angle = captureRotationAngle
+        let angle = frozenOrientation?.videoRotationAngle ?? captureRotationAngle
         let orientation = CaptureOrientation(videoRotationAngle: angle)
         let cameraID = device.uniqueID
         let lensType = Self.lensLabel(device)
@@ -1182,11 +1186,15 @@ private nonisolated final class SequenceCaptureDelegate: NSObject, AVCapturePhot
 
         // Position in the ladder comes from the settings AVFoundation echoes back, so the bracket
         // can be reconstructed deterministically even if callbacks arrive out of order.
-        let bracketBias = (photo.bracketSettings as? AVCaptureAutoExposureBracketedStillImageSettings)?
-            .exposureTargetBias
-        // `sequenceCount` is AVFoundation's own 1-based position inside this request.
-        let reportedPosition = photo.sequenceCount >= 1 ? photo.sequenceCount - 1 : received
-        let fallbackPosition = min(reportedPosition, max(0, requestedEVs.count - 1))
+        // Only a bracket request carries bracket settings; a single-photo request never reads them
+        // (the simulator's injected camera aborts on that accessor).
+        let bracketBias: Float? = requestedEVs.count > 1
+            ? (photo.bracketSettings as? AVCaptureAutoExposureBracketedStillImageSettings)?.exposureTargetBias
+            : nil
+        // Without echoed bracket settings, arrival order is the fallback. `AVCapturePhoto.sequenceCount`
+        // is deliberately not read: some camera implementations (the simulator's injected camera)
+        // abort on it. A wrong placement still cannot overwrite a frame — collisions fail below.
+        let fallbackPosition = min(received, max(0, requestedEVs.count - 1))
         let requestedEV = bracketBias.map { Double($0) } ?? requestedEVs[fallbackPosition]
         let ladderPosition = requestedEVs.firstIndex { abs($0 - requestedEV) < 0.01 } ?? fallbackPosition
         let sequenceIndex = baseIndex + ladderPosition
@@ -1274,8 +1282,8 @@ private nonisolated final class SequenceCaptureDelegate: NSObject, AVCapturePhot
         if let brightness = exif?[kCGImagePropertyExifBrightnessValue as String] as? Double {
             extras["brightnessValue"] = String(format: "%.3f", brightness)
         }
-        extras["photoCount"] = String(photo.photoCount)
-        extras["sequenceCount"] = String(photo.sequenceCount)
+        // `photoCount` / `sequenceCount` are deliberately not read: the simulator's injected camera
+        // aborts on them, and the bundle already records every frame's position and callback.
         return (bias, duration, iso, aperture, focalLength, extras)
     }
 }

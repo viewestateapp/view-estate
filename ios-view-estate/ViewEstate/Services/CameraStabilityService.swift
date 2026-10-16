@@ -226,8 +226,11 @@ final class CameraStabilityService {
     private(set) var reading: StabilityReading = .idle
     private(set) var isSensorAvailable: Bool = false
     private(set) var isRunning: Bool = false
+    /// Physical orientation of the phone (debounced, with hysteresis). Frozen during a bracket.
+    private(set) var orientation: CaptureOrientation = .portrait
 
     @ObservationIgnored private let manager = CMMotionManager()
+    @ObservationIgnored private var orientationTracker = OrientationTracker()
     @ObservationIgnored private var analyzer: StabilityAnalyzer
     @ObservationIgnored private var latest: StabilityReading = .idle
     @ObservationIgnored private var lastPublishedAt: TimeInterval = 0
@@ -284,6 +287,27 @@ final class CameraStabilityService {
         isRunning = false
     }
 
+    // MARK: - Orientation
+
+    /// The orientation a capture must use when the shutter is tapped. `nil` without a motion
+    /// sensor, so the camera falls back to its own rotation coordinator.
+    var captureOrientation: CaptureOrientation? {
+        isSensorAvailable ? orientation : nil
+    }
+
+    /// Freezes the presented orientation for the duration of a bracket.
+    func freezeOrientation() {
+        orientationTracker.freeze()
+    }
+
+    /// Resumes orientation tracking and adopts wherever the phone ended up.
+    func releaseOrientation() {
+        orientationTracker.release()
+        if orientationTracker.orientation != orientation {
+            orientation = orientationTracker.orientation
+        }
+    }
+
     // MARK: - Capture window
 
     /// Freezes the "before" reading (including roll and pitch) at the shutter tap.
@@ -316,6 +340,12 @@ final class CameraStabilityService {
         )
         let next = analyzer.ingest(sample)
         latest = next
+        let physical = orientationTracker.ingest(
+            gravityX: sample.gravityX,
+            gravityY: sample.gravityY,
+            timestamp: sample.timestamp
+        )
+        if physical != orientation { orientation = physical }
         recorder?.record(sample: sample, reading: next)
 
         let stateChanged = next.state != reading.state || next.isSevere != reading.isSevere || next.isLevel != reading.isLevel

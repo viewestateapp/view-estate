@@ -8,7 +8,7 @@ struct HomeView: View {
     @Environment(AppState.self) private var state
     @State private var showAccount = false
     @State private var showCredits = false
-    @State private var selectedCapture: CaptureItem?
+    @State private var viewerRoute: PhotoViewerRoute?
 
     var body: some View {
         NavigationStack {
@@ -50,9 +50,7 @@ struct HomeView: View {
             .toolbarBackground(VE.canvas, for: .navigationBar)
             .sheet(isPresented: $showAccount) { AccountView() }
             .sheet(isPresented: $showCredits) { CreditsView() }
-            .sheet(item: $selectedCapture) { capture in
-                PhotoDetailView(captureID: capture.id, onCapture: onCapture)
-            }
+            .photoViewer($viewerRoute) { property, room in onCapture(property, room) }
         }
     }
 
@@ -180,7 +178,7 @@ struct HomeView: View {
                 HStack(alignment: .top, spacing: 12) {
                     ForEach(state.captures.prefix(6)) { capture in
                         Button {
-                            selectedCapture = capture
+                            viewerRoute = PhotoViewerRoute(captureID: capture.id)
                         } label: {
                             CaptureThumbnail(capture: capture)
                         }

@@ -223,6 +223,16 @@ nonisolated enum HDRProcessingService {
             throw HDRProcessingFailure(code: "HDR_SOURCE_INVALID", kind: .sourceRejected, detail: manifest.state.devLabel)
         }
         let frames = manifest.orderedFrames
+        // One capture, one geometry: frames that disagree on orientation are never merged.
+        if let first = frames.first,
+           frames.contains(where: { $0.orientation != first.orientation || $0.exifOrientation != first.exifOrientation })
+            || first.orientation != manifest.orientation {
+            throw HDRProcessingFailure(
+                code: CameraError.frameOrientationMismatch.code,
+                kind: .sourceRejected,
+                detail: "capture=\(manifest.orientation.devLabel)"
+            )
+        }
         let plan = BracketPlan(profile: manifest.captureProfile, segments: [manifest.requestedLadder], reason: "")
         let audit = BracketAuditor.audit(frames: frames, plan: plan, evidence: .unknown, verifyFromDisk: true)
 

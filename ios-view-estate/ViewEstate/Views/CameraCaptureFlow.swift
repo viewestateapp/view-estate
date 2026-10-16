@@ -1,8 +1,12 @@
 import SwiftUI
 
-/// Capture experience presented full screen: the viewfinder prototype and, once a
-/// sequence finishes, the short confirmation that sends the user straight back to shooting.
-/// The internal preparation pipeline is never surfaced here.
+/// Capture experience presented full screen.
+///
+/// The photographer stays in the camera: a successful shutter shows a brief, non-blocking
+/// "Capturada", updates the thumbnail at once and hands the photo to background preparation.
+/// The thumbnail opens the photo viewer straight away — EV 0 while preparing, the HDR master
+/// once ready. Leaving a room is the photographer's decision ("Concluir divisão"), which opens
+/// the room review. The full "Captura concluída" screen is kept only as a development fallback.
 struct CameraCaptureFlow: View {
     let property: Property
     let initialRoom: RoomType
@@ -15,6 +19,8 @@ struct CameraCaptureFlow: View {
     @State private var room: RoomType
     @State private var completedCapture: CaptureItem?
     @State private var showRoomPicker = false
+    @State private var showRoomReview = false
+    @State private var viewerCaptureID: UUID?
 
     init(property: Property, initialRoom: RoomType, previewCapturing: Bool = false) {
         self.property = property
@@ -38,12 +44,38 @@ struct CameraCaptureFlow: View {
                         localFile: outcome.localFile,
                         manifest: outcome.manifest
                     )
-                    withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) {
-                        completedCapture = capture
+                    UIAccessibility.post(notification: .announcement, argument: state.t("camera.feedback.captured"))
+                    if state.captureSummaryScreenEnabled {
+                        withAnimation(.spring(response: 0.4, dampingFraction: 0.85)) {
+                            completedCapture = capture
+                        }
                     }
+                },
+                onOpenPhoto: { id in
+                    withAnimation(.spring(response: 0.36, dampingFraction: 0.9)) { viewerCaptureID = id }
+                },
+                onFinishRoom: {
+                    withAnimation(.spring(response: 0.4, dampingFraction: 0.9)) { showRoomReview = true }
                 },
                 onClose: { dismiss() }
             )
+
+            if showRoomReview {
+                RoomReviewView(
+                    property: property,
+                    room: room,
+                    onOpen: { id in
+                        withAnimation(.spring(response: 0.36, dampingFraction: 0.9)) { viewerCaptureID = id }
+                    },
+                    onContinue: {
+                        withAnimation(.spring(response: 0.4, dampingFraction: 0.9)) { showRoomReview = false }
+                    },
+                    onNextRoom: { showRoomPicker = true },
+                    onFinish: { dismiss() }
+                )
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .zIndex(1)
+            }
 
             if let capture = completedCapture {
                 CaptureCompletedView(
@@ -58,6 +90,28 @@ struct CameraCaptureFlow: View {
                     onClose: { dismiss() }
                 )
                 .transition(.opacity.combined(with: .move(edge: .bottom)))
+                .zIndex(2)
+            }
+
+            if let viewerCaptureID {
+                // The same viewer every gallery opens; shown in place so the live camera keeps
+                // running underneath and closing returns to it instantly.
+                PhotoViewer(
+                    captureID: viewerCaptureID,
+                    onClose: {
+                        withAnimation(.spring(response: 0.32, dampingFraction: 0.92)) { self.viewerCaptureID = nil }
+                    },
+                    onRecapture: { _, recaptureRoom in
+                        room = recaptureRoom
+                        withAnimation(.spring(response: 0.4, dampingFraction: 0.9)) {
+                            showRoomReview = false
+                            completedCapture = nil
+                        }
+                    }
+                )
+                .id(viewerCaptureID)
+                .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                .zIndex(3)
             }
         }
         .sheet(isPresented: $showRoomPicker) {
@@ -69,7 +123,10 @@ struct CameraCaptureFlow: View {
                 ) { picked in
                     room = picked
                     showRoomPicker = false
-                    withAnimation(.easeInOut(duration: 0.25)) { completedCapture = nil }
+                    withAnimation(.easeInOut(duration: 0.25)) {
+                        completedCapture = nil
+                        showRoomReview = false
+                    }
                 }
                 .navigationTitle(state.t("capture.pick.room"))
                 .navigationBarTitleDisplayMode(.inline)
@@ -82,6 +139,7 @@ struct CameraCaptureFlow: View {
             }
             .preferredColorScheme(.dark)
         }
+        .statusBarHidden(viewerCaptureID != nil)
         .preferredColorScheme(.dark)
     }
 }
@@ -109,6 +167,10 @@ struct CameraPrototypeView: View {
     var previewCapturing: Bool = false
     /// Delivers the finished capture together with the attempt that produced it.
     let onCaptured: (CaptureAttempt, CaptureOutcome) -> Void
+    /// Opens the photo viewer for a capture (the bottom-left thumbnail).
+    var onOpenPhoto: (UUID) -> Void = { _ in }
+    /// The photographer decided this room is done.
+    var onFinishRoom: () -> Void = {}
     let onClose: () -> Void
 
     @Environment(AppState.self) private var state
@@ -122,7 +184,11 @@ struct CameraPrototypeView: View {
     @State private var shutterPulse = false
     @State private var errorMessage: String?
     @State private var showRoomPicker = false
-    @State private var showGallery = false
+    /// Orientation the overlay is currently laid out in; follows the phone with a short cross-fade.
+    @State private var overlayOrientation: CaptureOrientation = .portrait
+    @State private var overlayOpacity: Double = 1
+    /// Brief "✓ Capturada" after a successful shutter. Never blocks the camera.
+    @State private var capturedFeedback: UUID?
     @AppStorage("ve.camera.grid") private var showsGrid: Bool = true
     @AppStorage("ve.camera.level") private var showsLevel: Bool = true
 
@@ -151,6 +217,25 @@ struct CameraPrototypeView: View {
         state.cameraMode.isNative && !previewCapturing
     }
 
+    /// Physical orientation the camera interface follows. The iPhone shell is portrait-only, so
+    /// the camera counter-rotates its own overlay and glyphs; an iPad rotates its whole interface
+    /// and needs no counter-rotation.
+    private var uiOrientation: CaptureOrientation {
+        UIDevice.current.userInterfaceIdiom == .phone ? stability.orientation : .portrait
+    }
+
+    private var glyphRotation: Angle { uiOrientation.interfaceRotation }
+
+    /// Most recent photograph of this property — the thumbnail, updated the moment a capture
+    /// registers.
+    private var latestCapture: CaptureItem? {
+        state.captures.first { $0.propertyID == property.id }
+    }
+
+    private var roomHasPhotos: Bool {
+        state.captures.contains { $0.propertyID == property.id && $0.room == room }
+    }
+
     /// The session itself is unavailable — the only time a camera-open error may appear.
     private var isOpenFailure: Bool {
         guard isNative, !camera.isRunning, let failure = camera.failure else { return false }
@@ -173,15 +258,23 @@ struct CameraPrototypeView: View {
             }
         }
         .background(VE.overlay.ignoresSafeArea())
-        .statusBarHidden(false)
         .sensoryFeedback(.impact(weight: .medium), trigger: isCapturing) { _, capturing in capturing }
         .sensoryFeedback(.selection, trigger: room)
+        .sensoryFeedback(.success, trigger: capturedFeedback) { _, new in new != nil }
         .sheet(isPresented: $showRoomPicker) { roomPickerSheet }
-        .sheet(isPresented: $showGallery) {
-            GalleryView()
-                .preferredColorScheme(.dark)
+        .onAppear {
+            stability.start()
+            overlayOrientation = uiOrientation
         }
-        .onAppear { stability.start() }
+        .onChange(of: uiOrientation) { _, next in
+            rotateOverlay(to: next)
+        }
+        .task(id: capturedFeedback) {
+            guard capturedFeedback != nil else { return }
+            try? await Task.sleep(for: .milliseconds(1100))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.3)) { capturedFeedback = nil }
+        }
         .task {
             guard previewCapturing else { return }
             while !Task.isCancelled {
@@ -282,15 +375,12 @@ struct CameraPrototypeView: View {
 
     // MARK: - Viewfinder
 
+    /// The live image stays fixed to the hardware — held sideways, this 4:3 rectangle IS the
+    /// landscape 4:3 photograph. Everything drawn over it (grid, level, header, mode, messages)
+    /// is laid out in the phone's physical orientation, so it always reads upright.
     private var viewfinder: some View {
         Color.black
             .overlay { viewfinderContent }
-            .overlay {
-                if showsGrid, !isOpenFailure { CompositionGrid().allowsHitTesting(false) }
-            }
-            .overlay {
-                if showsLevel, !isOpenFailure, isCameraLive { levelGuide }
-            }
             .overlay {
                 // A whisper of dimming while the sequence runs — the exposures stay invisible.
                 Color.black
@@ -298,22 +388,71 @@ struct CameraPrototypeView: View {
                     .animation(.easeOut(duration: 0.18), value: isCapturing)
                     .allowsHitTesting(false)
             }
-            .overlay(alignment: .top) {
-                LinearGradient(colors: [.black.opacity(0.55), .clear], startPoint: .top, endPoint: .bottom)
-                    .frame(height: 96)
-                    .allowsHitTesting(false)
-            }
-            .overlay(alignment: .bottom) {
-                LinearGradient(colors: [.clear, .black.opacity(0.4)], startPoint: .top, endPoint: .bottom)
-                    .frame(height: 72)
-                    .allowsHitTesting(false)
+            .overlay {
+                OrientedContainer(orientation: overlayOrientation) {
+                    physicalOverlay
+                }
+                .opacity(overlayOpacity)
             }
             .clipped()
-            .overlay(alignment: .top) { headerOverlay }
-            .overlay(alignment: .bottom) { previewFooter }
-            .overlay(alignment: .bottom) { modeChip.padding(.bottom, 52) }
             .accessibilityElement(children: .contain)
             .accessibilityLabel(state.t("camera.prototype"))
+    }
+
+    /// Overlay in physical coordinates: top is the top of the photograph being taken.
+    private var physicalOverlay: some View {
+        ZStack {
+            if showsGrid, !isOpenFailure { CompositionGrid().allowsHitTesting(false) }
+            if showsLevel, !isOpenFailure, isCameraLive { levelGuide }
+
+            VStack(spacing: 0) {
+                LinearGradient(colors: [.black.opacity(0.55), .clear], startPoint: .top, endPoint: .bottom)
+                    .frame(height: 96)
+                Spacer(minLength: 0)
+                LinearGradient(colors: [.clear, .black.opacity(0.4)], startPoint: .top, endPoint: .bottom)
+                    .frame(height: 72)
+            }
+            .allowsHitTesting(false)
+        }
+        .overlay(alignment: .top) { headerOverlay }
+        .overlay(alignment: .topTrailing) { queueIndicator }
+        .overlay(alignment: .bottom) { previewFooter }
+        .overlay(alignment: .bottom) { modeChip.padding(.bottom, 52) }
+    }
+
+    /// "3 a preparar": photographs (never exposures) still preparing in the background.
+    @ViewBuilder
+    private var queueIndicator: some View {
+        let count = state.captures.filter { $0.propertyID == property.id && $0.status == .preparing }.count
+        if count > 0, !isOpenFailure {
+            HStack(spacing: 5) {
+                PreparingDots(tint: VE.textPrimary.opacity(0.85))
+                Text(state.t("camera.queue", count))
+                    .font(.system(size: 11, weight: .medium).monospacedDigit())
+                    .foregroundStyle(VE.textPrimary.opacity(0.85))
+                    .contentTransition(.numericText())
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .background(.black.opacity(0.4), in: .capsule)
+            .padding(.top, 8)
+            .padding(.trailing, 10)
+            .transition(.opacity)
+            .animation(.easeOut(duration: 0.2), value: count)
+            .accessibilityElement(children: .combine)
+        }
+    }
+
+    /// Cross-fades the overlay into the new physical orientation. The camera session, the
+    /// selected property and room, and any running attempt are untouched.
+    private func rotateOverlay(to next: CaptureOrientation) {
+        guard next != overlayOrientation else { return }
+        Task {
+            withAnimation(.easeIn(duration: 0.12)) { overlayOpacity = 0 }
+            try? await Task.sleep(for: .milliseconds(120))
+            overlayOrientation = next
+            withAnimation(.easeOut(duration: 0.2)) { overlayOpacity = 1 }
+        }
     }
 
     /// The live rear camera in native mode, the reference frame in simulated mode, and a
@@ -321,9 +460,9 @@ struct CameraPrototypeView: View {
     @ViewBuilder
     private var viewfinderContent: some View {
         if isNative, camera.access.needsSystemSettings {
-            permissionState
+            OrientedContainer(orientation: overlayOrientation) { permissionState }
         } else if isOpenFailure {
-            openFailureState
+            OrientedContainer(orientation: overlayOrientation) { openFailureState }
         } else if isNative {
             CameraPreview(service: camera)
                 .allowsHitTesting(false)
@@ -399,16 +538,36 @@ struct CameraPrototypeView: View {
         .accessibilityIdentifier("camera.error")
     }
 
-    /// Transient capture message, kept above the mode chip.
+    /// Transient capture message or the brief "✓ Capturada", kept above the mode chip.
     private var previewFooter: some View {
         VStack {
             if let errorMessage, !isOpenFailure {
                 captureMessage(errorMessage)
                     .transition(.opacity.combined(with: .move(edge: .bottom)))
+            } else if capturedFeedback != nil {
+                capturedToast
+                    .transition(.opacity.combined(with: .scale(scale: 0.92)))
             }
         }
         .padding(.bottom, 104)
         .animation(.easeOut(duration: 0.22), value: errorMessage)
+        .animation(.spring(response: 0.3, dampingFraction: 0.8), value: capturedFeedback)
+    }
+
+    private var capturedToast: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "checkmark")
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(VE.success)
+            Text(state.t("camera.feedback.captured"))
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(VE.textPrimary)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(.black.opacity(0.55), in: .capsule)
+        .accessibilityHidden(true)
+        .accessibilityIdentifier("camera.feedback.captured")
     }
 
     private func captureMessage(_ message: String) -> some View {
@@ -572,6 +731,8 @@ struct CameraPrototypeView: View {
                 .font(.system(size: 15, weight: ultraWideActive ? .regular : .semibold))
                 .foregroundStyle(ultraWideActive ? VE.textSecondary : VE.textPrimary)
         }
+        .rotationEffect(glyphRotation)
+        .animation(.spring(response: 0.4, dampingFraction: 0.82), value: glyphRotation)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(state.t("camera.lens")) \(ultraWideActive ? "0.5" : "1")")
     }
@@ -585,6 +746,7 @@ struct CameraPrototypeView: View {
                 Image(systemName: "xmark")
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(VE.textPrimary)
+                    .rotationEffect(glyphRotation)
                     .frame(width: 40, height: 40)
                     .overlay(
                         RoundedRectangle(cornerRadius: 12)
@@ -597,10 +759,50 @@ struct CameraPrototypeView: View {
 
             Spacer()
 
+            if roomHasPhotos {
+                finishRoomButton
+                    .transition(.opacity)
+            }
+
+            Spacer()
+
             toolbarToggle(systemImage: "square.grid.3x3", title: state.t("camera.tool.grid"), isOn: $showsGrid)
             toolbarToggle(systemImage: "level", title: state.t("camera.tool.level"), isOn: $showsLevel)
         }
         .padding(.horizontal, 24)
+        .animation(.easeOut(duration: 0.2), value: roomHasPhotos)
+        .animation(.spring(response: 0.4, dampingFraction: 0.82), value: glyphRotation)
+    }
+
+    /// "Concluir divisão": the photographer, not the app, decides when a room is done. Held
+    /// sideways the label would not fit the toolbar, so it becomes its glyph.
+    private var finishRoomButton: some View {
+        Button {
+            onFinishRoom()
+        } label: {
+            Group {
+                if uiOrientation.isLandscape {
+                    Image(systemName: "checkmark.rectangle.stack")
+                        .font(.system(size: 17, weight: .medium))
+                        .foregroundStyle(VE.copper)
+                        .rotationEffect(glyphRotation)
+                        .frame(width: 44, height: 40)
+                } else {
+                    Text(state.t("camera.room.finish"))
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(VE.copper)
+                        .padding(.horizontal, 12)
+                        .frame(height: 32)
+                        .overlay(Capsule().strokeBorder(VE.copper.opacity(0.45), lineWidth: 1))
+                        .frame(minHeight: 44)
+                }
+            }
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .disabled(isCapturing)
+        .accessibilityLabel(state.t("camera.room.finish"))
+        .accessibilityIdentifier("camera.finishRoom")
     }
 
     private func toolbarToggle(systemImage: String, title: String, isOn: Binding<Bool>) -> some View {
@@ -610,6 +812,7 @@ struct CameraPrototypeView: View {
             Image(systemName: systemImage)
                 .font(.system(size: 17, weight: .medium))
                 .foregroundStyle(isOn.wrappedValue ? VE.copper : VE.textPrimary.opacity(0.55))
+                .rotationEffect(glyphRotation)
                 .frame(width: 44, height: 40)
                 .contentShape(.rect)
         }
@@ -630,15 +833,25 @@ struct CameraPrototypeView: View {
         .padding(.horizontal, 32)
     }
 
+    /// The last photograph, updated the moment it registers. Opens the photo viewer by capture
+    /// id — in any preparation state.
     private var galleryThumbnail: some View {
         Button {
-            showGallery = true
+            guard let capture = latestCapture else { return }
+            onOpenPhoto(capture.id)
         } label: {
             Group {
-                if let capture = state.captures.first {
-                    CaptureImage(capture: capture)
+                if let capture = latestCapture {
+                    Color(VE.elevated)
                         .frame(width: 44, height: 44)
+                        .overlay {
+                            CaptureImage(capture: capture)
+                                .allowsHitTesting(false)
+                        }
                         .clipShape(.circle)
+                        .rotationEffect(glyphRotation)
+                        .id(capture.id)
+                        .transition(.scale(scale: 0.6).combined(with: .opacity))
                 } else {
                     Circle()
                         .fill(VE.textPrimary.opacity(0.12))
@@ -653,10 +866,13 @@ struct CameraPrototypeView: View {
             .overlay(Circle().strokeBorder(VE.textPrimary.opacity(0.22), lineWidth: 1))
             .frame(width: 50, height: 50)
             .contentShape(.circle)
+            .animation(.spring(response: 0.38, dampingFraction: 0.75), value: latestCapture?.id)
+            .animation(.spring(response: 0.4, dampingFraction: 0.82), value: glyphRotation)
         }
         .buttonStyle(ShutterPressStyle(scale: 0.92))
-        .disabled(isCapturing)
-        .accessibilityLabel(state.t("camera.tool.gallery"))
+        .disabled(isCapturing || latestCapture == nil)
+        .accessibilityLabel(state.t("camera.tool.lastPhoto"))
+        .accessibilityIdentifier("camera.thumbnail")
     }
 
     /// The secondary action: the current room's symbol, opening the room chooser.
@@ -667,6 +883,8 @@ struct CameraPrototypeView: View {
             Image(systemName: room.symbol)
                 .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(VE.textPrimary.opacity(0.9))
+                .rotationEffect(glyphRotation)
+                .animation(.spring(response: 0.4, dampingFraction: 0.82), value: glyphRotation)
                 .frame(width: 44, height: 44)
                 .background(VE.textPrimary.opacity(0.1), in: .circle)
                 .frame(width: 50, height: 50)
@@ -749,6 +967,10 @@ struct CameraPrototypeView: View {
 
         isCapturing = true
         errorMessage = nil
+        // Orientation is frozen at the tap: every exposure of this attempt uses it, and the
+        // interface does not rotate until the bracket is finished.
+        stability.freezeOrientation()
+        let captureOrientation = stability.captureOrientation
         // Roll, pitch and the "before" stability are frozen at the tap.
         stability.beginCaptureWindow()
         let feedback = Task { await sweepLadder() }
@@ -759,7 +981,8 @@ struct CameraPrototypeView: View {
             result = try await camera.captureBracket(
                 clientCaptureID: attempt.id,
                 tapAt: tapAt,
-                availableBytesOverride: state.devAvailableBytesOverride
+                availableBytesOverride: state.devAvailableBytesOverride,
+                orientation: captureOrientation
             )
         } catch {
             let context = recordingContext(motion: stability.endCaptureWindow())
@@ -810,6 +1033,7 @@ struct CameraPrototypeView: View {
                     manifest: manifest
                 )
             )
+            capturedFeedback = attempt.id
         } catch {
             let code = (error as? CameraError) ?? .bracketCaptureFailed
             report(code, attempt: attempt, manifest: CaptureBundleStore.readManifest(clientCaptureID: attempt.id), result: result)
@@ -900,9 +1124,11 @@ struct CameraPrototypeView: View {
         guard let attempt = state.beginCaptureAttempt(property: property, room: room) else { return }
 
         isCapturing = true
+        stability.freezeOrientation()
         await animateBracket()
         finishCapturing()
         onCaptured(attempt, CaptureOutcome(frameCount: simulatedExposures.count))
+        capturedFeedback = attempt.id
     }
 
     /// Subtle capture feedback while the real bracket runs: the same hairline ladder animation
@@ -921,6 +1147,7 @@ struct CameraPrototypeView: View {
         withAnimation(.easeOut(duration: 0.2)) { activeFrame = nil }
         isCapturing = false
         shutterPulse = false
+        stability.releaseOrientation()
         state.endCaptureSequence()
     }
 

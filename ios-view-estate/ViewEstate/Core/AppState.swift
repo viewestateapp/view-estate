@@ -232,6 +232,57 @@ final class AppState {
 
     private var preparationTasks: [UUID: Task<Void, Never>] = [:]
 
+    // MARK: - Photo review
+
+    /// Development fallback: push the full "Captura concluída" screen after every photo instead of
+    /// staying in the camera. Off in normal use.
+    var captureSummaryScreenEnabled: Bool = false
+    /// Real captures that could not be shown with real pixels (`REAL_CAPTURE_IMAGE_MISSING`) or
+    /// that were about to be shown with mock pixels (`REAL_CAPTURE_RENDERED_WITH_MOCK_ASSET`).
+    /// Developer diagnostics only; must stay empty.
+    private(set) var mediaIssues: [MediaIssue] = []
+
+    struct MediaIssue: Identifiable, Hashable, Sendable {
+        let id = UUID()
+        var captureID: UUID
+        var code: String
+        var at: Date
+    }
+
+    func recordMediaIssue(captureID: UUID, code: String) {
+        guard !mediaIssues.contains(where: { $0.captureID == captureID && $0.code == code }) else { return }
+        mediaIssues.append(MediaIssue(captureID: captureID, code: code, at: .now))
+        VELog.cameraError(code, "capture=\(captureID.uuidString.prefix(8))")
+    }
+
+    /// Captures of one property and room in shooting order (oldest first) — the photo viewer's
+    /// swipe sequence.
+    func reviewSequence(propertyID: UUID, room: RoomType) -> [CaptureItem] {
+        captures
+            .filter { $0.propertyID == propertyID && $0.room == room }
+            .sorted { $0.createdAt < $1.createdAt }
+    }
+
+    /// Builds the display preview of a real capture's EV 0 in the background. The camera
+    /// thumbnail and viewer show the original meanwhile, so nothing waits for it.
+    private func generateReferencePreview(for id: UUID) {
+        guard let capture = captures.first(where: { $0.id == id }),
+              capture.referencePreviewFileName == nil,
+              let file = capture.localFile,
+              let source = CaptureFileStore.url(for: file)
+        else { return }
+        let clientCaptureID = capture.clientCaptureID
+        Task { [weak self] in
+            let name = await Task.detached(priority: .utility) {
+                ReferencePreviewService.generate(clientCaptureID: clientCaptureID, source: source)
+            }.value
+            guard let self, let name,
+                  let index = self.captures.firstIndex(where: { $0.id == id })
+            else { return }
+            self.captures[index].referencePreviewFileName = name
+        }
+    }
+
     // MARK: - Init
 
     private static let regionKey = "ve.region"
@@ -354,8 +405,10 @@ final class AppState {
                 attachMaster(record, to: &item)
                 item.jobState = .ready
             }
+            item.referencePreviewFileName = ReferencePreviewService.existing(clientCaptureID: manifest.clientCaptureID)
             captures.insert(item, at: 0)
             restored += 1
+            generateReferencePreview(for: item.id)
             // Nothing may stay preparing forever after a relaunch.
             if item.jobState != .ready {
                 startPreparation(for: item.id)
@@ -441,6 +494,7 @@ final class AppState {
         }
 
         syncState = isOnline ? .uploading : .pending
+        generateReferencePreview(for: item.id)
         startPreparation(for: item.id)
         return item
     }

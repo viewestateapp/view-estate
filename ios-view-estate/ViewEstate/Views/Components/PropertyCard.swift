@@ -67,6 +67,16 @@ struct CaptureThumbnail: View {
                         .allowsHitTesting(false)
                 }
                 .clipShape(.rect(cornerRadius: VE.Radius.tile))
+                .overlay(alignment: .topLeading) {
+                    if capture.status == .error || capture.status == .needsRecapture {
+                        Image(systemName: "exclamationmark")
+                            .font(.system(size: 10, weight: .heavy))
+                            .foregroundStyle(Color(hex: 0x1B1410))
+                            .frame(width: 18, height: 18)
+                            .background(capture.status == .error ? VE.danger : VE.warning, in: .circle)
+                            .padding(6)
+                    }
+                }
                 .overlay(alignment: .topTrailing) {
                     if capture.isFavorite {
                         Image(systemName: "heart.fill")
