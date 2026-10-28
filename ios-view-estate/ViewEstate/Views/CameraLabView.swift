@@ -10,13 +10,21 @@ struct CameraLabView: View {
     @State private var exportURL: URL?
     @State private var exportMessage: String?
     @State private var isExporting = false
+    @State private var truthCheck = Full9TruthCheckModel()
 
     private var diagnostics: CameraDiagnostics { state.cameraDiagnostics }
     private var calibration: CameraCalibrationProfile { diagnostics.calibration }
     private var lastQuality: CaptureQualityReport? { diagnostics.lastManifest?.quality }
 
+    /// The most recent native (camera) capture: this run's last bracket, else the newest bundle on disk.
+    private var lastPhysicalManifest: CaptureManifest? {
+        if let manifest = diagnostics.lastManifest, manifest.captureSource == .nativeReal { return manifest }
+        return manifests.first { $0.captureSource == .nativeReal }
+    }
+
     var body: some View {
         List {
+            full9Section
             validationSection
             deviceSection
             calibrationSection
@@ -39,6 +47,38 @@ struct CameraLabView: View {
             reload()
         }
         .onDisappear { stability.stop() }
+    }
+
+    // MARK: - FULL_9 truth check
+
+    private var full9Section: some View {
+        Section {
+            if let manifest = lastPhysicalManifest {
+                if PhysicalValidationStore.isSimulator {
+                    note("SIMULATOR — not physical evidence.")
+                }
+                row("Captured", manifest.startedAt.formatted(date: .abbreviated, time: .standard))
+                row("Device", manifest.device)
+                if let check = truthCheck.check {
+                    Full9TruthCheckRows(check: check)
+                }
+                NavigationLink {
+                    ExposureTruthInspectorView(manifest: manifest)
+                } label: {
+                    link("Inspect \(manifest.requestedLadder.count) exposures")
+                }
+            } else {
+                note("No native capture on this device yet. Take one FULL_9 photo, then return here.")
+            }
+        } header: {
+            Text("FULL_9 truth check · last physical capture")
+        } footer: {
+            Text("Two native bracket requests (5 + 4) sound like 2–3 shutter events. Only callbacks, files, hashes and exposure levels decide the verdict.")
+        }
+        .listRowBackground(VE.surface)
+        .task(id: lastPhysicalManifest?.clientCaptureID) {
+            if let manifest = lastPhysicalManifest { await truthCheck.measure(manifest) }
+        }
     }
 
     // MARK: - Physical validation (D3-V)

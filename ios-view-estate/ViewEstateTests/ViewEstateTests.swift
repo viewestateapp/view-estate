@@ -1848,6 +1848,68 @@ struct RealHDRPipelineTests {
         #expect(live.displayFile?.fileName == manifest.referenceFrame?.fileName)
     }
 
+    // MARK: - FULL_9 truth check
+
+    private static func full9Manifest(
+        clientCaptureID: UUID,
+        callbacksPerRequest: [Int],
+        dropFrame: Int? = nil
+    ) throws -> CaptureManifest {
+        var frames = try Self.writeScene(.full9, clientCaptureID: clientCaptureID).map { frame -> CaptureFrame in
+            var tagged = frame
+            let request = frame.sequenceIndex < 5 ? 1 : 2
+            tagged.metadata[CaptureFrame.MetadataKey.requestNumber] = String(request)
+            tagged.metadata[CaptureFrame.MetadataKey.callbackOrdinal] = String(request == 1 ? frame.sequenceIndex + 1 : frame.sequenceIndex - 4)
+            tagged.metadata[CaptureFrame.MetadataKey.requestedPhotoCount] = request == 1 ? "5" : "4"
+            return tagged
+        }
+        if let dropFrame { frames.removeAll { $0.sequenceIndex == dropFrame } }
+        var evidence = Self.evidence(callbacksPerRequest.reduce(0, +), requests: [
+            frames.filter { $0.sequenceIndex < 5 }.count, frames.filter { $0.sequenceIndex >= 5 }.count,
+        ])
+        evidence.callbacksPerRequest = callbacksPerRequest
+        evidence.expectedPhotoCountPerRequest = [5, 4]
+        evidence.expectedPhotoCountSource = "NATIVE"
+        var manifest = Self.manifest(frames: frames, clientCaptureID: clientCaptureID, profile: .full9)
+        manifest.audit = BracketAuditor.audit(
+            frames: frames,
+            plan: BracketPlan(profile: .full9, segments: [Array(CaptureProfile.full9.exposureValues.prefix(5)), Array(CaptureProfile.full9.exposureValues.suffix(4))], reason: ""),
+            evidence: evidence
+        )
+        return manifest
+    }
+
+    // Two native requests (5 + 4), nine callbacks, nine real distinct files, one EV 0 → PASS.
+    @Test func full9TruthCheckPassesForTwoRequestsNineFrames() throws {
+        let id = UUID()
+        defer { CaptureBundleStore.delete(clientCaptureID: id) }
+        let manifest = try Self.full9Manifest(clientCaptureID: id, callbacksPerRequest: [5, 4])
+        let check = Full9TruthCheck(manifest: manifest, live: nil)
+        #expect(check.verdict == .pass, "\(check.failures)")
+        #expect(check.nativeRequests == 2)
+        #expect(check.requests.map(\.expectedPhotoCount) == [5, 4])
+        #expect(check.requests.map(\.callbacks) == [5, 4])
+        #expect(check.totalCallbacks == 9)
+        #expect(check.filesPersisted == 9)
+        #expect(check.uniqueHashes == 9)
+        #expect(check.distinctExposureLevels == 9)
+        #expect(check.ev0Count == 1)
+        #expect(check.actualProfile == .full9)
+        #expect(manifest.frames.allSatisfy { $0.requestNumber != nil })
+    }
+
+    // One missing callback in request 2 → FAIL naming the exact request and the missing frame.
+    @Test func full9TruthCheckFailsAndNamesTheMissingCallback() throws {
+        let id = UUID()
+        defer { CaptureBundleStore.delete(clientCaptureID: id) }
+        let manifest = try Self.full9Manifest(clientCaptureID: id, callbacksPerRequest: [5, 3], dropFrame: 8)
+        let check = Full9TruthCheck(manifest: manifest, live: nil)
+        #expect(check.verdict == .fail)
+        #expect(check.failures.contains { $0.hasPrefix("Request 2: 3/4 callbacks") })
+        #expect(check.failures.contains { $0.hasPrefix("Missing frame #8") })
+        #expect(!check.failures.contains { $0.hasPrefix("Request 1") })
+    }
+
     // MARK: - Fixtures
 
     private static let width = 320

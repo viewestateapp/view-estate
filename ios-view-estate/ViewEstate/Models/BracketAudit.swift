@@ -38,6 +38,12 @@ nonisolated struct BracketAudit: Codable, Hashable, Sendable {
     var lensPositionSpread: Double?
     var whiteBalanceGainSpread: Double?
     var validatedProfile: CaptureProfile
+    /// `didFinishProcessingPhoto` callbacks per native request, in order. `nil` on earlier manifests.
+    var callbacksPerRequest: [Int]? = nil
+    /// `expectedPhotoCount` AVFoundation resolved for each native request. `nil` on earlier manifests.
+    var expectedPhotoCountPerRequest: [Int]? = nil
+    /// NATIVE when read from `AVCaptureResolvedPhotoSettings`, REQUESTED when only the request size is known.
+    var expectedPhotoCountSource: String? = nil
 
     /// Every requested exposure exists as a real, unique, materially different file.
     var isTruthful: Bool {
@@ -72,6 +78,9 @@ nonisolated enum BracketAuditor {
         var callbacks: Int
         var callbackErrors: Int
         var indexCollisions: Int
+        var callbacksPerRequest: [Int] = []
+        var expectedPhotoCountPerRequest: [Int] = []
+        var expectedPhotoCountSource: String? = nil
 
         static let unknown = CallbackEvidence(
             nativeRequests: 0, framesPerRequest: [], callbacks: 0, callbackErrors: 0, indexCollisions: 0
@@ -159,7 +168,11 @@ nonisolated enum BracketAuditor {
             singleCamera: Set(ordered.map(\.cameraID)).count <= 1 && Set(ordered.map(\.lensType)).count <= 1,
             lensPositionSpread: lensSpread,
             whiteBalanceGainSpread: gainSpread,
-            validatedProfile: validated
+            validatedProfile: validated,
+            callbacksPerRequest: evidence.callbacksPerRequest.isEmpty ? nil : evidence.callbacksPerRequest,
+            expectedPhotoCountPerRequest: evidence.expectedPhotoCountPerRequest.isEmpty
+                ? nil : evidence.expectedPhotoCountPerRequest,
+            expectedPhotoCountSource: evidence.expectedPhotoCountSource
         )
     }
 

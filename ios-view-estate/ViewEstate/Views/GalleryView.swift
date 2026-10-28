@@ -292,6 +292,32 @@ struct PhotoDetailView: View {
     private func versions(_ capture: CaptureItem) -> some View {
         VStack(spacing: 0) {
             ForEach(Array(capture.assets.enumerated()), id: \.element.id) { index, version in
+                versionRow(version, capture: capture)
+
+                if index < capture.assets.count - 1 {
+                    Rectangle().fill(VE.border).frame(height: 1).padding(.leading, 52)
+                }
+            }
+        }
+        .veCard()
+    }
+
+    /// In development builds the original row opens the real persisted exposure files.
+    @ViewBuilder
+    private func versionRow(_ version: AssetVersion, capture: CaptureItem) -> some View {
+        if FeatureFlags.developerPanelEnabled, version.type == .original, let manifest = capture.manifest {
+            NavigationLink {
+                ExposureTruthInspectorView(manifest: manifest)
+            } label: {
+                versionLabel(version, inspectable: true)
+            }
+            .buttonStyle(.plain)
+        } else {
+            versionLabel(version, inspectable: false)
+        }
+    }
+
+    private func versionLabel(_ version: AssetVersion, inspectable: Bool) -> some View {
                 HStack(spacing: 12) {
                     Image(systemName: version.symbol)
                         .font(.system(size: 14, weight: .medium))
@@ -306,15 +332,14 @@ struct PhotoDetailView: View {
                             .font(VE.Font.status)
                             .foregroundStyle(VE.textTertiary)
                     }
+                    if inspectable {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(VE.textTertiary)
+                    }
                 }
                 .padding(.horizontal, VE.Space.m)
                 .padding(.vertical, 13)
-
-                if index < capture.assets.count - 1 {
-                    Rectangle().fill(VE.border).frame(height: 1).padding(.leading, 52)
-                }
-            }
-        }
-        .veCard()
+                .contentShape(.rect)
     }
 }

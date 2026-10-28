@@ -287,7 +287,7 @@ struct BracketAuditRows: View {
 }
 
 /// One real exposure, opened from its own file on disk, with its metadata.
-private struct DevFrameViewer: View {
+struct DevFrameViewer: View {
     let frame: CaptureFrame
 
     @State private var image: UIImage?
@@ -315,6 +315,8 @@ private struct DevFrameViewer: View {
 
                 Group {
                     line("sequence index", "#\(frame.sequenceIndex)")
+                    line("request", frame.requestNumber.map(String.init) ?? "not recorded")
+                    line("photoCount", frame.photoCountDescription)
                     line("requested EV", frame.evLabel)
                     line("actual bias", frame.actualBiasDescription)
                     line("exposure", frame.exposureDescription)

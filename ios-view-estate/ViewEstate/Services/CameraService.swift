@@ -659,12 +659,21 @@ final class CameraService {
             let outcome = await captureSegment(
                 exposures: segment,
                 baseIndex: frames.count,
+                requestNumber: evidence.framesPerRequest.count + 1,
                 rotationAngle: angle,
                 context: context
             )
 
             evidence.nativeRequests += outcome.requestIssued ? 1 : 0
             evidence.framesPerRequest.append(outcome.frames.count)
+            // Diagnostics only: what each native request promised and actually delivered.
+            evidence.callbacksPerRequest.append(outcome.callbacks)
+            evidence.expectedPhotoCountPerRequest.append(outcome.nativeExpectedPhotoCount ?? segment.count)
+            if outcome.nativeExpectedPhotoCount == nil {
+                evidence.expectedPhotoCountSource = "REQUESTED"
+            } else if evidence.expectedPhotoCountSource == nil {
+                evidence.expectedPhotoCountSource = "NATIVE"
+            }
             evidence.callbacks += outcome.callbacks
             evidence.callbackErrors += outcome.callbackErrors
             evidence.indexCollisions += outcome.indexCollisions
@@ -782,6 +791,7 @@ final class CameraService {
     private func captureSegment(
         exposures: [Double],
         baseIndex: Int,
+        requestNumber: Int,
         rotationAngle: CGFloat,
         context: SequenceContext
     ) async -> SegmentOutcome {
@@ -842,6 +852,7 @@ final class CameraService {
             let delegate = SequenceCaptureDelegate(
                 requestedEVs: exposures,
                 baseIndex: baseIndex,
+                requestNumber: requestNumber,
                 context: context
             ) { [weak self] outcome in
                 gate.cancelWatchdog()
@@ -1095,6 +1106,8 @@ private struct SegmentOutcome: Sendable {
     var callbackErrors: Int = 0
     /// Callbacks that resolved to a ladder position already written.
     var indexCollisions: Int = 0
+    /// `expectedPhotoCount` AVFoundation resolved for this request (physical device only).
+    var nativeExpectedPhotoCount: Int?
 }
 
 /// Guarantees one capture request resolves exactly once, whether it is the camera or the
@@ -1132,6 +1145,8 @@ private final class CaptureResumeGate: @unchecked Sendable {
 private nonisolated final class SequenceCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
     private let requestedEVs: [Double]
     private let baseIndex: Int
+    /// 1-based native request number within the shutter action. Diagnostics only.
+    private let requestNumber: Int
     private let context: SequenceContext
     private let completion: @Sendable (SegmentOutcome) -> Void
 
@@ -1143,17 +1158,46 @@ private nonisolated final class SequenceCaptureDelegate: NSObject, AVCapturePhot
     init(
         requestedEVs: [Double],
         baseIndex: Int,
+        requestNumber: Int,
         context: SequenceContext,
         completion: @escaping @Sendable (SegmentOutcome) -> Void
     ) {
         self.requestedEVs = requestedEVs
         self.baseIndex = baseIndex
+        self.requestNumber = requestNumber
         self.context = context
         self.completion = completion
     }
 
     func markRequestIssued() {
         outcome.requestIssued = true
+    }
+
+    /// Observation only: records how many photos AVFoundation committed to for this request.
+    func photoOutput(
+        _ output: AVCapturePhotoOutput,
+        willBeginCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings
+    ) {
+        outcome.nativeExpectedPhotoCount = Self.nativeExpectedPhotoCount(resolvedSettings)
+    }
+
+    /// `expectedPhotoCount` is only read on a physical device: the simulator's injected camera
+    /// implements the capture APIs partially and aborts on photo-count accessors.
+    private static func nativeExpectedPhotoCount(_ settings: AVCaptureResolvedPhotoSettings) -> Int? {
+        #if targetEnvironment(simulator)
+        return nil
+        #else
+        return settings.expectedPhotoCount
+        #endif
+    }
+
+    /// 1-based `photoCount` AVFoundation stamps on each delivered photo (physical device only).
+    private static func nativePhotoCount(_ photo: AVCapturePhoto) -> Int? {
+        #if targetEnvironment(simulator)
+        return nil
+        #else
+        return photo.photoCount
+        #endif
     }
 
     func photoOutput(
@@ -1163,6 +1207,8 @@ private nonisolated final class SequenceCaptureDelegate: NSObject, AVCapturePhot
     ) {
         guard !hasFinished else { return }
         outcome.callbacks += 1
+        let callbackOrdinal = outcome.callbacks
+        let nativePhotoCountAtArrival = Self.nativePhotoCount(photo)
 
         if error != nil {
             outcome.callbackErrors += 1
@@ -1231,7 +1277,18 @@ private nonisolated final class SequenceCaptureDelegate: NSObject, AVCapturePhot
             frame.lensPosition = lensPosition
             frame.whiteBalance = whiteBalance
             frame.sensorTimestampSeconds = timestamp.isFinite && timestamp > 0 ? timestamp : nil
-            frame.metadata = metadata.extras
+            var extras = metadata.extras
+            // Truth-check evidence: which native request delivered this file, and where in it.
+            extras[CaptureFrame.MetadataKey.requestNumber] = String(requestNumber)
+            extras[CaptureFrame.MetadataKey.callbackOrdinal] = String(callbackOrdinal)
+            extras[CaptureFrame.MetadataKey.requestedPhotoCount] = String(requestedEVs.count)
+            if let photoCount = nativePhotoCountAtArrival {
+                extras[CaptureFrame.MetadataKey.nativePhotoCount] = String(photoCount)
+            }
+            if let expected = outcome.nativeExpectedPhotoCount {
+                extras[CaptureFrame.MetadataKey.nativeExpectedPhotoCount] = String(expected)
+            }
+            frame.metadata = extras
             outcome.frames.append(frame)
         } catch {
             outcome.failure = .frameSaveFailed
