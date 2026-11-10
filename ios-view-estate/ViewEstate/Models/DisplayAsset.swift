@@ -38,7 +38,7 @@ enum DisplayAssetResolver {
     static let missingCode = "REAL_CAPTURE_IMAGE_MISSING"
 
     static func resolve(_ capture: CaptureItem, maxPixel: Int) -> DisplayedAsset {
-        if let master = capture.hdrMaster, capture.hdrState == .generated {
+        if let master = capture.activeMaster, capture.hdrState == .generated {
             let name = maxPixel <= HDRProcessingService.previewMaxPixel ? master.previewFileName : master.fileName
             if let url = CaptureBundleStore.url(clientCaptureID: master.clientCaptureID, fileName: name) {
                 return DisplayedAsset(type: .hdrMaster, source: .viewEstateHDR, url: url)

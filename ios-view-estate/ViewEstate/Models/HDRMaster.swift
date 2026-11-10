@@ -32,8 +32,16 @@ nonisolated enum HDRStage: String, Codable, Hashable, Sendable {
     case validating = "VALIDATING"
     case decoding = "DECODING"
     case aligning = "ALIGNING"
+    // VE-HDR 2.0 only
+    case normalizing = "NORMALIZING"
+    case analyzingMotion = "MOTION_ANALYSIS"
+    case deghosting = "DEGHOSTING"
     case merging = "MERGING"
     case toneMapping = "TONE_MAPPING"
+    // VE-HDR 2.0 only
+    case denoising = "DENOISING"
+    case sharpening = "SHARPENING"
+    case qualityCheck = "QUALITY_CHECK"
     case writing = "WRITING"
     case verifying = "VERIFYING"
     case done = "DONE"

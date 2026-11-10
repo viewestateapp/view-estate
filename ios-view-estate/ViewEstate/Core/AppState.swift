@@ -114,6 +114,14 @@ final class AppState {
     private var hdrJobTokens: [UUID: UUID] = [:]
     /// Overridable for tests.
     var hdrTimeoutSeconds: Double = HDRProcessingService.timeoutSeconds
+    /// Which pipeline new captures run. V2 by default; V1 stays available and untouched.
+    var hdrPipeline: HDRPipelineSelection = .v2
+    /// Every VE-HDR 2.0 tunable. Overridable for tests and the developer panel.
+    var hdrProfileV2: HDRProcessingProfile = .realEstateStandardV2
+    /// Outer watchdog for V2. The pipeline also checks its own deadline between stages.
+    var hdrV2TimeoutSeconds: Double = HDRProcessingProfile.realEstateStandardV2.timeoutSeconds + 15
+    /// Most recent verified VE-HDR 2.0 result. Developer panel only.
+    private(set) var lastHDRV2Result: HDRMasterV2Record?
 
     // MARK: - Camera
 
@@ -405,6 +413,11 @@ final class AppState {
                 attachMaster(record, to: &item)
                 item.jobState = .ready
             }
+            if let record = HDRMasterV2Store.read(clientCaptureID: manifest.clientCaptureID) {
+                attachMasterV2(record, to: &item)
+                item.jobState = .ready
+                if (lastHDRV2Result?.createdAt ?? .distantPast) < record.createdAt { lastHDRV2Result = record }
+            }
             item.referencePreviewFileName = ReferencePreviewService.existing(clientCaptureID: manifest.clientCaptureID)
             captures.insert(item, at: 0)
             restored += 1
@@ -567,7 +580,12 @@ final class AppState {
 
     /// Runs the real HDR pipeline for one capture, off the main actor, under a watchdog.
     /// Processing is local: it needs no connectivity and costs no AI credits.
-    private func startRealHDR(for id: UUID, manifest: CaptureManifest) {
+    private func startRealHDR(for id: UUID, manifest: CaptureManifest, pipeline selection: HDRPipelineSelection? = nil) {
+        let pipeline = selection ?? hdrPipeline
+        if pipeline.runsV2 {
+            startRealHDRV2(for: id, manifest: manifest, alsoRunV1: pipeline.runsV1)
+            return
+        }
         guard let index = captures.firstIndex(where: { $0.id == id }) else { return }
         preparationTasks[id]?.cancel()
         let token = UUID()
@@ -613,6 +631,110 @@ final class AppState {
         }
     }
 
+    /// VE-HDR 2.0 job. With `alsoRunV1` (developer "both") V1 runs first and keeps its own files;
+    /// V2 then writes its own master beside it. Neither ever overwrites the other.
+    private func startRealHDRV2(for id: UUID, manifest: CaptureManifest, alsoRunV1: Bool) {
+        guard let index = captures.firstIndex(where: { $0.id == id }) else { return }
+        preparationTasks[id]?.cancel()
+        let token = UUID()
+        hdrJobTokens[id] = token
+        captures[index].hdrState = .pending
+        captures[index].jobState = .queued
+        let now = Date()
+        hdrJobs[id] = HDRJobDiagnostics(jobStartedAt: now, stage: .queued, lastProgressAt: now)
+        let timeout = hdrV2TimeoutSeconds + (alsoRunV1 ? hdrTimeoutSeconds : 0)
+        let profile = hdrProfileV2
+
+        preparationTasks[id] = Task { [weak self] in
+            guard let self else { return }
+            while self.isCapturing && !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(300))
+            }
+            guard !Task.isCancelled, self.hdrJobTokens[id] == token else { return }
+            self.setJobState(id, .processing)
+            self.setHDRState(id, .processing)
+
+            let watchdog = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(timeout))
+                guard !Task.isCancelled else { return }
+                self?.failHDR(id, token: token, code: HDRPipelineV2.Code.timeout, kind: .technical)
+            }
+            let progress: @Sendable (HDRStage) -> Void = { stage in
+                Task { @MainActor [weak self] in
+                    self?.updateHDRStage(id, token: token, stage: stage)
+                }
+            }
+
+            if alsoRunV1 {
+                let v1 = await Task.detached(priority: .utility) {
+                    HDRProcessingService.process(manifest: manifest, captureID: id, progress: progress)
+                }.value
+                if case .success(let record) = v1, self.hdrJobTokens[id] == token,
+                   let index = self.captures.firstIndex(where: { $0.id == id }) {
+                    self.attachMaster(record, to: &self.captures[index])
+                    self.captures[index].hdrState = .processing
+                }
+            }
+            guard !Task.isCancelled, self.hdrJobTokens[id] == token else { watchdog.cancel(); return }
+
+            let result = await Task.detached(priority: .utility) {
+                HDRPipelineV2.process(manifest: manifest, captureID: id, profile: profile, progress: progress)
+            }.value
+            watchdog.cancel()
+
+            switch result {
+            case .success(let record):
+                self.completeHDRV2(id, token: token, record: record)
+            case .failure(let failure):
+                // A V1 master produced in the same job still makes the capture ready.
+                if alsoRunV1, self.captures.first(where: { $0.id == id })?.hdrMaster != nil {
+                    self.completeAfterV2Failure(id, token: token, code: failure.code)
+                } else {
+                    self.failHDR(id, token: token, code: failure.code, kind: failure.kind)
+                }
+            }
+        }
+    }
+
+    private func completeHDRV2(_ id: UUID, token: UUID, record: HDRMasterV2Record) {
+        guard hdrJobTokens[id] == token, let index = captures.firstIndex(where: { $0.id == id }) else { return }
+        attachMasterV2(record, to: &captures[index])
+        captures[index].activeHDRVersion = .v2
+        captures[index].jobState = .ready
+        lastHDRV2Result = record
+        closeHDRJob(id, stage: .done, errorCode: nil)
+        VELog.camera(
+            "hdr v2 ready capture=\(id.uuidString.prefix(8)) size=\(record.sizeDescription) "
+                + "\(record.dimensionDescription) t=\(String(format: "%.1f", record.processingDuration))s "
+                + "qa=\(record.qualityResult.rawValue) warnings=\(record.warnings.joined(separator: ","))"
+        )
+        finishJob(id)
+    }
+
+    private func completeAfterV2Failure(_ id: UUID, token: UUID, code: String) {
+        guard hdrJobTokens[id] == token, let index = captures.firstIndex(where: { $0.id == id }) else { return }
+        captures[index].hdrState = .generated
+        captures[index].activeHDRVersion = .v1
+        captures[index].jobState = .ready
+        closeHDRJob(id, stage: .done, errorCode: code)
+        VELog.cameraError(code, "hdr v2 capture=\(id.uuidString.prefix(8)) (V1 kept)")
+        finishJob(id)
+    }
+
+    /// Developer only: runs a pipeline again on an existing capture's stored exposures, without
+    /// reshooting. Existing masters of other versions stay on disk and in the lineage.
+    func reprocessHDR(captureID: UUID, pipeline: HDRPipelineSelection) {
+        guard let capture = captures.first(where: { $0.id == captureID }),
+              let manifest = capture.manifest, manifest.state.isValid else { return }
+        startRealHDR(for: captureID, manifest: manifest, pipeline: pipeline)
+    }
+
+    /// Developer only: which verified master the capture displays.
+    func setActiveHDRVersion(_ version: HDRMasterVersion, for captureID: UUID) {
+        guard let index = captures.firstIndex(where: { $0.id == captureID }) else { return }
+        captures[index].activeHDRVersion = version
+    }
+
     private func setHDRState(_ id: UUID, _ hdrState: HDRState) {
         guard let index = captures.firstIndex(where: { $0.id == id }) else { return }
         captures[index].hdrState = hdrState
@@ -643,6 +765,15 @@ final class AppState {
         guard hdrJobTokens[id] == token, let index = captures.firstIndex(where: { $0.id == id }) else { return }
         // Invalidate the token: a late result of this job can no longer change anything.
         hdrJobTokens[id] = UUID()
+        if captures[index].activeMaster != nil {
+            // A re-run failed, but a verified master from an earlier run is still on disk.
+            captures[index].hdrState = .generated
+            captures[index].jobState = .ready
+            closeHDRJob(id, stage: .failed, errorCode: code)
+            VELog.cameraError(code, "hdr capture=\(id.uuidString.prefix(8)) (earlier master kept)")
+            finishJob(id)
+            return
+        }
         switch kind {
         case .technical:
             captures[index].hdrState = .failed
@@ -676,7 +807,9 @@ final class AppState {
     private func attachMaster(_ record: HDRMasterRecord, to item: inout CaptureItem) {
         item.hdrMaster = record
         item.hdrState = .generated
-        guard !item.assets.contains(where: { $0.type == .hdrMaster }) else { return }
+        // A V1 re-run replaces the same files, so it replaces its own lineage entry too.
+        item.assets.removeAll { $0.type == .hdrMaster && $0.versionNumber == 1 && $0.id != record.assetID }
+        guard !item.assets.contains(where: { $0.id == record.assetID }) else { return }
         item.assets.append(
             AssetVersion(
                 id: record.assetID,
@@ -684,6 +817,24 @@ final class AppState {
                 type: .hdrMaster,
                 label: "HDR Master",
                 versionNumber: 1,
+                createdAt: record.createdAt
+            )
+        )
+    }
+
+    /// Appends the V2 master as its own version. A V1 master and its asset stay untouched.
+    private func attachMasterV2(_ record: HDRMasterV2Record, to item: inout CaptureItem) {
+        item.hdrMasterV2 = record
+        item.hdrState = .generated
+        item.assets.removeAll { $0.type == .hdrMaster && $0.versionNumber == 2 && $0.id != record.assetID }
+        guard !item.assets.contains(where: { $0.id == record.assetID }) else { return }
+        item.assets.append(
+            AssetVersion(
+                id: record.assetID,
+                parentAssetID: item.originalAsset?.id,
+                type: .hdrMaster,
+                label: "HDR Master V2",
+                versionNumber: 2,
                 createdAt: record.createdAt
             )
         )

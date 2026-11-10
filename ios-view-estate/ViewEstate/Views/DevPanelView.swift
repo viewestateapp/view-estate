@@ -251,6 +251,8 @@ struct DevPanelView: View {
                 }
                 .listRowBackground(VE.surface)
 
+                hdrV2Section
+
                 Section("Photo review — mock check") {
                     Toggle(isOn: summaryScreenBinding) {
                         Text("Capture summary screen after each photo")
@@ -415,6 +417,15 @@ struct DevPanelView: View {
                             .foregroundStyle(VE.textSecondary)
                     }
                     .tint(VE.success)
+                    Picker(selection: hdrPipelineBinding) {
+                        ForEach(HDRPipelineSelection.allCases) { option in
+                            Text(option.rawValue).tag(option)
+                        }
+                    } label: {
+                        Text("hdr_pipeline")
+                            .font(.system(size: 13, design: .monospaced))
+                            .foregroundStyle(VE.textSecondary)
+                    }
                     flag("ai_tools_enabled", FeatureFlags.aiToolsEnabled)
                     flag("billing_enabled", FeatureFlags.billingEnabled)
                     flag("credit_purchase_enabled", FeatureFlags.creditPurchaseEnabled)
@@ -470,7 +481,10 @@ struct DevPanelView: View {
         let original = capture.captureSource == .nativeReal ? "original (REAL)" : "original (SIMULATED)"
         let hdr: String
         switch capture.hdrState {
-        case .generated where capture.hdrMaster != nil: hdr = "hdrMaster (REAL file)"
+        case .generated where capture.hdrMaster != nil && capture.hdrMasterV2 != nil:
+            hdr = "hdrMaster V1 + V2 (REAL files, active \(capture.activeHDRVersion?.rawValue ?? "V2"))"
+        case .generated where capture.hdrMasterV2 != nil: hdr = "hdrMaster V2 (REAL file)"
+        case .generated where capture.hdrMaster != nil: hdr = "hdrMaster V1 (REAL file)"
         case .pending, .processing: hdr = "hdrMaster (PROCESSING)"
         case .failed: hdr = "hdrMaster (FAILED)"
         case .sourceRejected: hdr = "hdrMaster (SOURCE_REJECTED)"
@@ -521,6 +535,70 @@ struct DevPanelView: View {
 
     private var realHDRBinding: Binding<Bool> {
         Binding(get: { state.realHDREnabled }, set: { state.realHDREnabled = $0 })
+    }
+
+    private var hdrPipelineBinding: Binding<HDRPipelineSelection> {
+        Binding(get: { state.hdrPipeline }, set: { state.hdrPipeline = $0 })
+    }
+
+    // MARK: - VE-HDR 2.0
+
+    @ViewBuilder
+    private var hdrV2Section: some View {
+        Section("VE-HDR 2.0 — LAST RESULT") {
+            if let r = state.lastHDRV2Result {
+                debugRow("Capture ID", String(r.captureID.uuidString.prefix(8)))
+                debugRow("Pipeline", "\(r.pipelineVersion) · \(r.profileVersion)")
+                debugRow("Input frames", "\(r.inputFrameIDs.count)")
+                debugRow("Excluded frames", r.exclusions.isEmpty ? "0" : r.exclusions.map { "\($0.fileName): \($0.exclusionReason)" }.joined(separator: "; "))
+                debugRow("Alignment confidence", String(format: "%.2f", r.alignmentConfidence))
+                debugRow("Rotation correction", String(format: "%.2f°", r.maxRotationCorrection))
+                debugRow("Crop X / Y", String(format: "%.2f%% / %.2f%%", r.cropPercentX, r.cropPercentY))
+                debugRow("Motion detected", r.motionDetected ? "YES" : "NO")
+                debugRow("Motion coverage", String(format: "%.2f%%", r.motionCoverage))
+                debugRow("Ghosting risk", r.ghostingRisk.rawValue)
+                debugRow("Deghost applied", r.deghostApplied ? String(format: "YES (%.2f)", r.deghostConfidence) : "NO")
+                debugRow("Highlight clip EV0 → HDR", String(format: "%.2f%% → %.2f%%", r.ev0HighlightClipping, r.highlightClipping))
+                debugRow("Shadow clip EV0 → HDR", String(format: "%.2f%% → %.2f%%", r.ev0ShadowClipping, r.shadowClipping))
+                debugRow("Noise / sharpness", String(format: "%.2f / %.2f", r.noiseEstimate, r.sharpnessEstimate))
+                debugRow("Master", "\(r.dimensionDescription) · \(r.sizeDescription)")
+                debugRow("Processing resolution", r.processingResolution)
+                debugRow("Peak memory", String(format: "%.0f MB", r.peakMemoryMB))
+                debugRow("Processing time", String(format: "%.1f s", r.processingDuration))
+                debugRow("QA", r.qualityResult.rawValue)
+                debugRow("Warnings", r.warnings.isEmpty ? "—" : r.warnings.joined(separator: ", "))
+                debugRow("File", HDRMasterV2Store.path(r))
+            } else {
+                Text("No VE-HDR 2.0 master yet.")
+                    .font(.system(size: 13))
+                    .foregroundStyle(VE.textTertiary)
+            }
+            if let capture = state.lastCapture, capture.manifest?.state.isValid == true {
+                NavigationLink {
+                    HDRLabView(captureID: capture.id)
+                } label: {
+                    Text("HDR Lab").foregroundStyle(VE.textPrimary)
+                }
+                Button("Reprocess last capture with V2") {
+                    state.reprocessHDR(captureID: capture.id, pipeline: .v2)
+                }
+                Button("Reprocess last capture with V1") {
+                    state.reprocessHDR(captureID: capture.id, pipeline: .v1)
+                }
+                if capture.hdrMaster != nil && capture.hdrMasterV2 != nil {
+                    Picker("Active master", selection: Binding(
+                        get: { capture.activeHDRVersion ?? .v2 },
+                        set: { state.setActiveHDRVersion($0, for: capture.id) }
+                    )) {
+                        Text("V1").tag(HDRMasterVersion.v1)
+                        Text("V2").tag(HDRMasterVersion.v2)
+                    }
+                    .pickerStyle(.segmented)
+                }
+            }
+        }
+        .listRowBackground(VE.surface)
+        .foregroundStyle(VE.textPrimary)
     }
 
     private var syncBinding: Binding<SyncState> {

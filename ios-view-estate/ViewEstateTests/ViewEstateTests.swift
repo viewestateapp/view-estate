@@ -1741,6 +1741,7 @@ struct RealHDRPipelineTests {
     @Test func captureReachesReadyOnlyWithARealMasterAndCostsNothing() async throws {
         let state = AppState()
         state.realHDREnabled = true
+        state.hdrPipeline = .v1
         let property = try #require(state.properties.first)
         let balance = state.wallet.total
         let transactions = state.transactions.count
@@ -1791,6 +1792,7 @@ struct RealHDRPipelineTests {
     @Test func rejectedSourceEndsInNeedsRecapture() async throws {
         let state = AppState()
         state.realHDREnabled = true
+        state.hdrPipeline = .v1
         let property = try #require(state.properties.first)
 
         let attempt = try #require(state.beginCaptureAttempt(property: property, room: .kitchen))
@@ -1821,6 +1823,7 @@ struct RealHDRPipelineTests {
     @Test func watchdogEndsAStuckJob() async throws {
         let state = AppState()
         state.realHDREnabled = true
+        state.hdrPipeline = .v1
         state.hdrTimeoutSeconds = 0.001
         let property = try #require(state.properties.first)
 

@@ -184,6 +184,10 @@ struct CaptureItem: Identifiable, Hashable, Sendable {
     var hdrState: HDRState = .mock
     /// The real, verified HDR master. Only set once its file exists and reads back intact.
     var hdrMaster: HDRMasterRecord?
+    /// The VE-HDR 2.0 master. Lives beside V1 and never replaces its files.
+    var hdrMasterV2: HDRMasterV2Record?
+    /// Which verified master the app shows. `nil` falls back to whichever exists (V2 first).
+    var activeHDRVersion: HDRMasterVersion?
     /// Display-sized EV 0 preview inside the capture bundle, once generated.
     var referencePreviewFileName: String?
 
@@ -192,7 +196,17 @@ struct CaptureItem: Identifiable, Hashable, Sendable {
     /// What the gallery and photo detail show: the real HDR master once it exists, the EV 0
     /// reference exposure until then. The user never loses access to the photograph.
     var displayFile: LocalPhotoFile? {
-        hdrMaster?.masterFile ?? localFile
+        activeMaster?.masterFile ?? localFile
+    }
+
+    /// The master every display surface uses: the chosen version when it exists, otherwise V2,
+    /// otherwise V1. V1 always stays on disk as its own lineage entry.
+    var activeMaster: HDRMasterRecord? {
+        switch activeHDRVersion {
+        case .v1: return hdrMaster ?? hdrMasterV2?.displayRecord
+        case .v2: return hdrMasterV2?.displayRecord ?? hdrMaster
+        case nil: return hdrMasterV2?.displayRecord ?? hdrMaster
+        }
     }
 
     /// A capture whose original bytes already live on this device.
@@ -205,7 +219,7 @@ struct CaptureItem: Identifiable, Hashable, Sendable {
     /// owns the capture; MOCK otherwise.
     var hdrSource: HDRSource {
         switch hdrState {
-        case .generated: hdrMaster == nil ? .mock : .real
+        case .generated: activeMaster == nil ? .mock : .real
         case .pending, .processing: .realProcessing
         case .mock, .failed, .sourceRejected: .mock
         }

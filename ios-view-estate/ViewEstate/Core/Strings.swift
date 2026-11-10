@@ -192,7 +192,10 @@ enum Strings {
         "capture.done.pendingSync": "Guardada no dispositivo. Vai sincronizar quando voltar a ter ligação.",
 
         // Photo detail
-        "photo.versions": "Versões",
+        "photo.versions": "Informações e versões",
+        "photo.compare": "Comparar",
+        "photo.compare.subtitle": "Original ↔ HDR",
+        "photo.compare.hint": "Arraste para comparar a exposição original com o HDR.",
         "photo.original.immutable": "Original imutável",
         "photo.derivative": "Derivado",
         "photo.favorite": "Favorito",
@@ -483,7 +486,10 @@ enum Strings {
         "capture.done.nextRoom": "Próximo cômodo",
         "capture.done.pendingSync": "Salva no dispositivo. Vai sincronizar quando a conexão voltar.",
 
-        "photo.versions": "Versões",
+        "photo.versions": "Informações e versões",
+        "photo.compare": "Comparar",
+        "photo.compare.subtitle": "Original ↔ HDR",
+        "photo.compare.hint": "Arraste para comparar a exposição original com o HDR.",
         "photo.original.immutable": "Original imutável",
         "photo.derivative": "Derivado",
         "photo.favorite": "Favorito",

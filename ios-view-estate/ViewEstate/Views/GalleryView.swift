@@ -94,6 +94,48 @@ struct GalleryView: View {
     }
 }
 
+/// Original (EV 0) ↔ HDR comparison of one capture, opened by captureID. Real files only.
+struct HDRCompareScreen: View {
+    let captureID: UUID
+    var previewCapture: CaptureItem?
+
+    @Environment(AppState.self) private var state
+
+    private var capture: CaptureItem? {
+        previewCapture ?? state.captures.first { $0.id == captureID }
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: VE.Space.m) {
+                if let capture, let master = capture.activeMaster {
+                    let usesV2 = capture.hdrMasterV2?.assetID == master.assetID
+                    let crop = usesV2 ? capture.hdrMasterV2?.crop.displayInsets(exifOrientation: master.exifOrientation) : nil
+                    let portrait = [5, 6, 7, 8].contains(master.exifOrientation)
+                    let longSide = Double(max(master.pixelWidth, master.pixelHeight))
+                    let shortSide = Double(max(1, min(master.pixelWidth, master.pixelHeight)))
+                    BeforeAfterCompareView(
+                        beforeURL: CaptureBundleStore.url(clientCaptureID: master.clientCaptureID, fileName: master.referenceFileName),
+                        afterURL: CaptureBundleStore.url(clientCaptureID: master.clientCaptureID, fileName: master.fileName),
+                        beforeCrop: crop ?? (0, 0, 0, 0)
+                    )
+                    .aspectRatio(portrait ? shortSide / longSide : longSide / shortSide, contentMode: .fit)
+                    .clipShape(.rect(cornerRadius: VE.Radius.card))
+
+                    Text(state.t("photo.compare.hint"))
+                        .font(VE.Font.caption)
+                        .foregroundStyle(VE.textSecondary)
+                }
+            }
+            .padding(VE.Space.m)
+        }
+        .background(VE.canvas)
+        .navigationTitle(state.t("photo.compare"))
+        .navigationBarTitleDisplayMode(.inline)
+        .preferredColorScheme(.dark)
+    }
+}
+
 /// Photo detail. Reads the live capture from state so a photo that finishes preparing
 /// updates in place: A preparar → Pronta. Recovery actions appear only when needed.
 struct PhotoDetailView: View {
@@ -289,17 +331,61 @@ struct PhotoDetailView: View {
         .padding(.vertical, 13)
     }
 
+    /// Rows shown under "Informações e versões". A normal user sees one HDR Master (the active
+    /// one); developer builds list every verified master version separately.
+    private func visibleAssets(_ capture: CaptureItem) -> [AssetVersion] {
+        let masters = capture.assets.filter { $0.type == .hdrMaster }
+        guard !FeatureFlags.developerPanelEnabled, masters.count > 1,
+              let active = capture.activeMaster else { return capture.assets }
+        return capture.assets.filter { $0.type != .hdrMaster || $0.id == active.assetID }
+    }
+
     private func versions(_ capture: CaptureItem) -> some View {
-        VStack(spacing: 0) {
-            ForEach(Array(capture.assets.enumerated()), id: \.element.id) { index, version in
+        let assets = visibleAssets(capture)
+        let showsCompare = capture.hdrState == .generated && capture.activeMaster != nil
+        return VStack(spacing: 0) {
+            ForEach(Array(assets.enumerated()), id: \.element.id) { index, version in
                 versionRow(version, capture: capture)
 
-                if index < capture.assets.count - 1 {
+                if index < assets.count - 1 || showsCompare {
                     Rectangle().fill(VE.border).frame(height: 1).padding(.leading, 52)
                 }
             }
+            if showsCompare {
+                NavigationLink {
+                    HDRCompareScreen(captureID: capture.id, previewCapture: previewCapture)
+                } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: "rectangle.split.2x1")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(VE.copper)
+                            .frame(width: 24)
+                        Text(state.t("photo.compare"))
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundStyle(VE.textPrimary)
+                        Spacer()
+                        Text(state.t("photo.compare.subtitle"))
+                            .font(VE.Font.status)
+                            .foregroundStyle(VE.textTertiary)
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(VE.textTertiary)
+                    }
+                    .padding(.horizontal, VE.Space.m)
+                    .padding(.vertical, 13)
+                    .contentShape(.rect)
+                }
+                .buttonStyle(.plain)
+            }
         }
         .veCard()
+    }
+
+    /// The real master file behind an HDR asset row, if that asset is a verified V1 or V2 master.
+    private func masterRecord(for version: AssetVersion, capture: CaptureItem) -> HDRMasterRecord? {
+        if let v2 = capture.hdrMasterV2, v2.assetID == version.id { return v2.displayRecord }
+        if let v1 = capture.hdrMaster, v1.assetID == version.id { return v1 }
+        return nil
     }
 
     /// In development builds the original row opens the real persisted exposure files.
@@ -312,21 +398,40 @@ struct PhotoDetailView: View {
                 versionLabel(version, inspectable: true)
             }
             .buttonStyle(.plain)
+        } else if version.type == .hdrMaster, capture.hdrState == .generated,
+                  let record = masterRecord(for: version, capture: capture) {
+            NavigationLink {
+                HDRMasterFileView(
+                    title: FeatureFlags.developerPanelEnabled ? version.label : "HDR Master",
+                    url: CaptureBundleStore.url(clientCaptureID: record.clientCaptureID, fileName: record.fileName),
+                    lines: FeatureFlags.developerPanelEnabled
+                        ? [("pipeline", record.pipelineVersion), ("dimensions", record.dimensionDescription), ("file size", record.sizeDescription)]
+                        : []
+                )
+            } label: {
+                versionLabel(version, inspectable: true, isActive: FeatureFlags.developerPanelEnabled && capture.activeMaster?.assetID == version.id)
+            }
+            .buttonStyle(.plain)
         } else {
             versionLabel(version, inspectable: false)
         }
     }
 
-    private func versionLabel(_ version: AssetVersion, inspectable: Bool) -> some View {
+    private func versionLabel(_ version: AssetVersion, inspectable: Bool, isActive: Bool = false) -> some View {
                 HStack(spacing: 12) {
                     Image(systemName: version.symbol)
                         .font(.system(size: 14, weight: .medium))
                         .foregroundStyle(version.type == .aiDerivative ? VE.ai : VE.copper)
                         .frame(width: 24)
-                    Text(version.label)
+                    Text(FeatureFlags.developerPanelEnabled || version.type != .hdrMaster ? version.label : "HDR Master")
                         .font(.system(size: 15, weight: .medium))
                         .foregroundStyle(VE.textPrimary)
                     Spacer()
+                    if isActive {
+                        Text("ACTIVE")
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .foregroundStyle(VE.copper)
+                    }
                     if version.type == .original {
                         Text(state.t("photo.original.immutable"))
                             .font(VE.Font.status)
