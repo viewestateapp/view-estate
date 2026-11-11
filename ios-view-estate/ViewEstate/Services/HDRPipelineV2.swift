@@ -60,6 +60,7 @@ nonisolated enum HDRPipelineV2 {
         manifest: CaptureManifest,
         captureID: UUID,
         profile: HDRProcessingProfile = .realEstateStandardV2,
+        cancellation: HDRCancellationFlag? = nil,
         progress: @Sendable (HDRStage) -> Void
     ) -> Result<HDRMasterV2Record, HDRProcessingFailure> {
         let started = Date()
@@ -96,7 +97,7 @@ nonisolated enum HDRPipelineV2 {
             var unionBinary = [UInt8](repeating: 0, count: smallWidth * smallHeight)
 
             for source in inputs.frames {
-                try checkDeadline(deadline)
+                try checkDeadline(deadline, cancellation)
                 if source.frame.id == inputs.reference.id {
                     analyses.append(FrameAnalysis(
                         source: source,
@@ -233,7 +234,7 @@ nonisolated enum HDRPipelineV2 {
             }
 
             // 3 · working resolution, chosen against the memory actually available.
-            try checkDeadline(deadline)
+            try checkDeadline(deadline, cancellation)
             let sourceLongSide = max(inputs.reference.width, inputs.reference.height, smallWidth, smallHeight)
             let workingMaxPixel = try chooseWorkingMaxPixel(sourceLongSide: sourceLongSide, aspect: Double(smallWidth) / Double(smallHeight), profile: profile)
 
@@ -265,7 +266,9 @@ nonisolated enum HDRPipelineV2 {
             let anyMotion = unionMotion.contains { $0 > 0.001 }
 
             for (analysis, transform) in zip(included, workingTransforms) {
-                try checkDeadline(deadline)
+                try checkDeadline(deadline, cancellation)
+                // Heartbeat: each merged frame counts as progress for the queue watchdog.
+                progress(.merging)
                 let isReference = analysis.status == .reference
                 let image: PixelPlane<UInt8>
                 if isReference {
@@ -311,7 +314,7 @@ nonisolated enum HDRPipelineV2 {
             }
 
             // 5 · tone map → denoise → sharpen → crop
-            try checkDeadline(deadline)
+            try checkDeadline(deadline, cancellation)
             progress(.toneMapping)
             let toned = toneMap(accumulator, profile: profile)
             sampleMemory()
@@ -365,7 +368,7 @@ nonisolated enum HDRPipelineV2 {
             }
 
             // 7 · write master, preview and thumbnail
-            try checkDeadline(deadline)
+            try checkDeadline(deadline, cancellation)
             progress(.writing)
             let orientation = inputs.reference.exifOrientation
             guard let image = makeImage(output.plane, width: output.width, height: output.height),
@@ -485,7 +488,8 @@ nonisolated enum HDRPipelineV2 {
         HDRProcessingFailure(code: code, kind: kind, detail: detail)
     }
 
-    private static func checkDeadline(_ deadline: Date) throws {
+    private static func checkDeadline(_ deadline: Date, _ cancellation: HDRCancellationFlag?) throws {
+        if cancellation?.isCancelled == true { throw failure(Code.timeout, .technical, "cancelled by queue watchdog") }
         if Date() > deadline { throw failure(Code.timeout, .technical, "deadline") }
     }
 

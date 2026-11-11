@@ -182,7 +182,8 @@ nonisolated struct HDRProcessingProfile: Hashable, Sendable {
         maxNoiseEstimate: 6,
         minSharpnessEstimate: 1.5,
         minMasterLongSide: 1600,
-        timeoutSeconds: 180,
+        // A job longer than this fails with V2_TIMEOUT; the queue watchdog enforces the same limit.
+        timeoutSeconds: 120,
         writesLabArtifacts: true
     )
 }

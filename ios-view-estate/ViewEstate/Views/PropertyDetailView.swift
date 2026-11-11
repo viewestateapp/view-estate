@@ -88,9 +88,9 @@ struct PropertyDetailView: View {
         HStack(spacing: 0) {
             metric("\(property.rooms.count)", state.t("properties.detail.rooms"))
             Rectangle().fill(VE.border).frame(width: 1, height: 32)
-            metric("\(property.photoCount)", state.t("properties.detail.photos"))
+            metric("\(state.photoCount(for: property))", state.t("properties.detail.photos"))
             Rectangle().fill(VE.border).frame(width: 1, height: 32)
-            metric("\(captures.filter { $0.status == .ready }.count)", state.t("status.ready"))
+            metric("\(state.readyCount(for: property.id))", state.t("status.ready"))
         }
         .padding(.vertical, VE.Space.m)
         .veCard()

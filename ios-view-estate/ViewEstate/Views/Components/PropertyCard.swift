@@ -34,7 +34,7 @@ struct PropertyCard: View {
                     Text("\(property.address), \(property.city)")
                         .font(VE.Font.caption)
                         .foregroundStyle(VE.textSecondary)
-                    Text("\(state.t("properties.rooms", property.rooms.count)) · \(state.t("properties.photos", property.photoCount))")
+                    Text("\(state.t("properties.rooms", property.rooms.count)) · \(state.t("properties.photos", state.photoCount(for: property)))")
                         .font(VE.Font.caption)
                         .foregroundStyle(VE.textTertiary)
                         .padding(.top, 2)

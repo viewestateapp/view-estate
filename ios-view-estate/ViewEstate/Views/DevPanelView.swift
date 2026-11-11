@@ -251,6 +251,8 @@ struct DevPanelView: View {
                 }
                 .listRowBackground(VE.surface)
 
+                hdrQueueSection
+                hdrCaptureDiagnosticsSection
                 hdrV2Section
 
                 Section("Photo review — mock check") {
@@ -539,6 +541,102 @@ struct DevPanelView: View {
 
     private var hdrPipelineBinding: Binding<HDRPipelineSelection> {
         Binding(get: { state.hdrPipeline }, set: { state.hdrPipeline = $0 })
+    }
+
+    // MARK: - HDR processing queue
+
+    private func clock(_ date: Date?) -> String {
+        date?.formatted(date: .omitted, time: .standard) ?? "—"
+    }
+
+    private var hdrQueueSection: some View {
+        Section("HDR PROCESSING QUEUE") {
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                VStack(alignment: .leading, spacing: 10) {
+                    debugRow("Worker", state.hdrWorkerActive ? "ACTIVE (concurrency 1)" : "IDLE")
+                    debugRow("Limits", String(format: "stall %.0f s · timeout V2 %.0f s", state.hdrStallSeconds, state.hdrV2TimeoutSeconds))
+                    if state.hdrQueue.isEmpty {
+                        Text("No HDR job in this session.")
+                            .font(.system(size: 13))
+                            .foregroundStyle(VE.textTertiary)
+                    }
+                    ForEach(state.hdrQueue.reversed()) { job in
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack {
+                                Text(String(job.captureID.uuidString.prefix(8)))
+                                    .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                                Spacer()
+                                Text(job.state.rawValue)
+                                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                                    .foregroundStyle(color(for: job.state))
+                            }
+                            Group {
+                                Text("Pipeline \(job.requestedPipeline.rawValue) → \(job.actualPipeline?.rawValue ?? "—") · Stage \(job.stage.queueLabel)")
+                                Text("Queued \(clock(job.queuedAt)) · Started \(clock(job.startedAt))")
+                                Text(String(format: "Elapsed %.1f s · Last progress %@ (%.0f s ago)", job.elapsedSeconds(now: context.date), clock(job.lastProgressAt), job.secondsSinceProgress(now: context.date)))
+                                Text("Retry \(job.retryCount) · Error \(job.errorCode ?? "—")")
+                                if let detail = job.errorDetail {
+                                    Text(detail)
+                                }
+                            }
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(VE.textSecondary)
+                        }
+                        .padding(.vertical, 4)
+                    }
+                    Button("Restore pending HDR jobs") { state.restorePendingHDRJobs() }
+                }
+            }
+        }
+        .listRowBackground(VE.surface)
+        .foregroundStyle(VE.textPrimary)
+    }
+
+    private func color(for jobState: HDRQueueJobState) -> Color {
+        switch jobState {
+        case .ready: VE.success
+        case .failed, .cancelled: VE.danger
+        case .stalled: VE.warning
+        case .running, .queued: VE.textPrimary
+        }
+    }
+
+    /// Every real capture with its job, so a capture stuck without a job is visible at once.
+    private var hdrCaptureDiagnosticsSection: some View {
+        Section("HDR — PER CAPTURE") {
+            let real = state.captures.filter { $0.manifest != nil }
+            if real.isEmpty {
+                Text("No real capture on this device.")
+                    .font(.system(size: 13))
+                    .foregroundStyle(VE.textTertiary)
+            }
+            ForEach(real) { capture in
+                let job = state.latestHDRJob(for: capture.id)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("\(capture.shortID) · \(state.roomName(capture.room))")
+                        .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                    Group {
+                        Text("Source \(capture.captureSource.devLabel) · Processing \(capture.jobState.rawValue) · HDR \(capture.hdrState.rawValue)")
+                        Text("Requested \(job?.requestedPipeline.rawValue ?? state.hdrPipeline.rawValue) · Actual \(job?.actualPipeline?.rawValue ?? "—")")
+                        Text("Job exists \(job == nil ? "NO" : "YES") · Job ID \(job.map { String($0.id.uuidString.prefix(8)) } ?? "—")")
+                        Text("Created \(clock(job?.queuedAt)) · Started \(clock(job?.startedAt)) · Stage \(job?.stage.queueLabel ?? "—")")
+                        Text("Last progress \(clock(job?.lastProgressAt)) · Worker \(job?.state.isRunning == true ? "ACTIVE" : "—") · Queue \(state.hdrQueuePosition(for: capture.id).map(String.init) ?? "—") · Retries \(job?.retryCount ?? 0)")
+                        if let check = state.hdrInputChecks[capture.id] {
+                            Text("Input \(check.summary)")
+                        }
+                        if state.hdrMissingJobs[capture.id] != nil {
+                            Text("V2_JOB_NOT_CREATED (recreated at \(clock(state.hdrMissingJobs[capture.id])))")
+                                .foregroundStyle(VE.danger)
+                        }
+                    }
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(VE.textSecondary)
+                }
+                .padding(.vertical, 2)
+            }
+        }
+        .listRowBackground(VE.surface)
+        .foregroundStyle(VE.textPrimary)
     }
 
     // MARK: - VE-HDR 2.0

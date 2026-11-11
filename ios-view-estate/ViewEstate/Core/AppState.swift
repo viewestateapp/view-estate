@@ -84,7 +84,7 @@ final class AppState {
     }
 
     var totalPhotos: Int {
-        properties.reduce(0) { $0 + $1.photoCount }
+        properties.reduce(0) { $0 + photoCount(for: $1) }
     }
 
     // MARK: - Capture session (prototype)
@@ -118,8 +118,26 @@ final class AppState {
     var hdrPipeline: HDRPipelineSelection = .v2
     /// Every VE-HDR 2.0 tunable. Overridable for tests and the developer panel.
     var hdrProfileV2: HDRProcessingProfile = .realEstateStandardV2
-    /// Outer watchdog for V2. The pipeline also checks its own deadline between stages.
-    var hdrV2TimeoutSeconds: Double = HDRProcessingProfile.realEstateStandardV2.timeoutSeconds + 15
+    /// Total time limit of one V2 job, measured from when the worker starts it. Past it the job
+    /// fails with `V2_TIMEOUT` and the worker is released at once.
+    var hdrV2TimeoutSeconds: Double = HDRProcessingProfile.realEstateStandardV2.timeoutSeconds
+    /// No progress for this long marks a running job STALLED (a warning, not an end).
+    var hdrStallSeconds: Double = 30
+    /// Longest a job waits for an active shutter sequence before it starts anyway.
+    var hdrCaptureDeferSeconds: Double = 15
+    /// Watchdog polling interval. Overridable for tests.
+    var hdrWatchdogInterval: Double = 0.5
+    /// App-level HDR queue (concurrency 1), newest last. Kept as history for the developer panel.
+    private(set) var hdrQueue: [HDRQueueJob] = []
+    private var hdrWorker: Task<Void, Never>?
+    private var hdrWorkerID: UUID?
+    private var hdrSuspendedAt: Date?
+    /// Physical input check of each capture's latest job.
+    private(set) var hdrInputChecks: [UUID: HDRInputCheckResult] = [:]
+    /// Captures found preparing with no job at all (`V2_JOB_NOT_CREATED`), and when.
+    private(set) var hdrMissingJobs: [UUID: Date] = [:]
+    /// True while the single HDR worker owns a job.
+    var hdrWorkerActive: Bool { hdrWorker != nil }
     /// Most recent verified VE-HDR 2.0 result. Developer panel only.
     private(set) var lastHDRV2Result: HDRMasterV2Record?
 
@@ -318,6 +336,7 @@ final class AppState {
 
         // A capture whose frames and manifest were safely persisted survives a relaunch.
         restorePendingCaptures()
+        restorePendingHDRJobs()
 
         // An open physical validation keeps collecting across relaunches.
         if let session = PhysicalValidationStore.load() {
@@ -354,6 +373,17 @@ final class AppState {
 
     func property(_ id: UUID) -> Property? {
         properties.first { $0.id == id }
+    }
+
+    /// Photographs of a property: one per capture, whatever its state, never per exposure.
+    /// A seeded catalogue count (mock portfolio) is a floor, so restored captures always count.
+    func photoCount(for property: Property) -> Int {
+        max(property.photoCount, captures(for: property.id).count)
+    }
+
+    /// Captures of a property that reached READY.
+    func readyCount(for propertyID: UUID) -> Int {
+        captures(for: propertyID).filter { $0.status == .ready }.count
     }
 
     func captures(for propertyID: UUID) -> [CaptureItem] {
@@ -528,7 +558,7 @@ final class AppState {
     private func startPreparation(for id: UUID) {
         guard let capture = captures.first(where: { $0.id == id }) else { return }
         if realHDREnabled, let manifest = capture.manifest, manifest.state.isValid {
-            startRealHDR(for: id, manifest: manifest)
+            enqueueHDR(captureID: id)
         } else {
             startMockPreparation(for: id)
         }
@@ -576,124 +606,291 @@ final class AppState {
         }
     }
 
-    // MARK: - Real HDR job
+    // MARK: - Real HDR job queue
 
-    /// Runs the real HDR pipeline for one capture, off the main actor, under a watchdog.
-    /// Processing is local: it needs no connectivity and costs no AI credits.
-    private func startRealHDR(for id: UUID, manifest: CaptureManifest, pipeline selection: HDRPipelineSelection? = nil) {
-        let pipeline = selection ?? hdrPipeline
-        if pipeline.runsV2 {
-            startRealHDRV2(for: id, manifest: manifest, alsoRunV1: pipeline.runsV1)
-            return
-        }
-        guard let index = captures.firstIndex(where: { $0.id == id }) else { return }
+    /// The active (queued, running or stalled) job of a capture, if any.
+    func activeHDRJob(for captureID: UUID) -> HDRQueueJob? {
+        hdrQueue.last { $0.captureID == captureID && $0.state.isActive }
+    }
+
+    /// Most recent job of a capture, whatever its state.
+    func latestHDRJob(for captureID: UUID) -> HDRQueueJob? {
+        hdrQueue.last { $0.captureID == captureID }
+    }
+
+    /// 1-based position among the jobs still waiting for the worker; `nil` when not waiting.
+    func hdrQueuePosition(for captureID: UUID) -> Int? {
+        let waiting = hdrQueue.filter { $0.state == .queued }
+        guard let index = waiting.firstIndex(where: { $0.captureID == captureID }) else { return nil }
+        return index + 1
+    }
+
+    /// Adds one capture to the app-level HDR queue. Idempotent: a capture that already has an
+    /// active job keeps it, so a restore or a repeated tap never duplicates work.
+    /// Processing is owned by the app, never by a view, so opening or closing the viewer,
+    /// the gallery or the developer panel cannot affect it.
+    @discardableResult
+    func enqueueHDR(captureID id: UUID, pipeline selection: HDRPipelineSelection? = nil) -> HDRQueueJob? {
+        guard let index = captures.firstIndex(where: { $0.id == id }),
+              let manifest = captures[index].manifest, manifest.state.isValid
+        else { return nil }
+        if let active = activeHDRJob(for: id) { return active }
+
         preparationTasks[id]?.cancel()
+        preparationTasks[id] = nil
         let token = UUID()
         hdrJobTokens[id] = token
         captures[index].hdrState = .pending
         captures[index].jobState = .queued
         let now = Date()
         hdrJobs[id] = HDRJobDiagnostics(jobStartedAt: now, stage: .queued, lastProgressAt: now)
-        let timeout = hdrTimeoutSeconds
+        let job = HDRQueueJob(
+            id: UUID(),
+            captureID: id,
+            requestedPipeline: selection ?? hdrPipeline,
+            actualPipeline: nil,
+            state: .queued,
+            stage: .queued,
+            queuedAt: now,
+            startedAt: nil,
+            finishedAt: nil,
+            lastProgressAt: now,
+            retryCount: hdrQueue.filter { $0.captureID == id }.count,
+            errorCode: nil,
+            errorDetail: nil
+        )
+        hdrQueue.append(job)
+        if hdrQueue.count > 200 {
+            // Only finished history is trimmed; active jobs always stay.
+            if let oldest = hdrQueue.firstIndex(where: { !$0.state.isActive }) { hdrQueue.remove(at: oldest) }
+        }
+        VELog.camera(
+            "hdr job queued capture=\(id.uuidString.prefix(8)) job=\(job.id.uuidString.prefix(8)) "
+                + "pipeline=\(job.requestedPipeline.rawValue) position=\(hdrQueuePosition(for: id) ?? 0)"
+        )
+        pumpHDRQueue()
+        return job
+    }
 
-        preparationTasks[id] = Task { [weak self] in
-            guard let self else { return }
-            // The camera always has priority over background work.
-            while self.isCapturing && !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(300))
+    /// Idempotent recovery, on launch and on every return to the foreground: every capture with
+    /// real frames that is still preparing without a verified master gets exactly one active job.
+    @discardableResult
+    func restorePendingHDRJobs() -> Int {
+        guard realHDREnabled else { return 0 }
+        var created = 0
+        for capture in captures where capture.status == .preparing && capture.activeMaster == nil {
+            guard let manifest = capture.manifest, manifest.state.isValid,
+                  activeHDRJob(for: capture.id) == nil
+            else { continue }
+            if hdrPipeline.runsV2 {
+                hdrMissingJobs[capture.id] = .now
+                VELog.cameraError("V2_JOB_NOT_CREATED", "capture=\(capture.id.uuidString.prefix(8)) — job recreated")
             }
-            guard !Task.isCancelled, self.hdrJobTokens[id] == token else { return }
-            self.setJobState(id, .processing)
-            self.setHDRState(id, .processing)
+            if enqueueHDR(captureID: capture.id) != nil { created += 1 }
+        }
+        pumpHDRQueue()
+        if created > 0 { VELog.camera("hdr restore recreated \(created) job(s)") }
+        return created
+    }
 
-            let watchdog = Task { [weak self] in
-                try? await Task.sleep(for: .seconds(timeout))
-                guard !Task.isCancelled else { return }
-                self?.failHDR(id, token: token, code: "HDR_TIMEOUT", kind: .technical)
-            }
-
-            let progress: @Sendable (HDRStage) -> Void = { stage in
-                Task { @MainActor [weak self] in
-                    self?.updateHDRStage(id, token: token, stage: stage)
+    /// App lifecycle hook. Time spent suspended does not count against a running job's limit;
+    /// on return to the foreground every pending capture is checked again.
+    func handleScenePhase(_ phase: ScenePhase) {
+        switch phase {
+        case .background:
+            if hdrSuspendedAt == nil { hdrSuspendedAt = .now }
+        case .active:
+            if let suspendedAt = hdrSuspendedAt {
+                let paused = Date().timeIntervalSince(suspendedAt)
+                for index in hdrQueue.indices where hdrQueue[index].state.isRunning {
+                    hdrQueue[index].startedAt = hdrQueue[index].startedAt?.addingTimeInterval(paused)
+                    hdrQueue[index].lastProgressAt = hdrQueue[index].lastProgressAt.addingTimeInterval(paused)
                 }
+                hdrSuspendedAt = nil
             }
-            let result = await Task.detached(priority: .utility) {
-                HDRProcessingService.process(manifest: manifest, captureID: id, progress: progress)
-            }.value
-            watchdog.cancel()
-
-            switch result {
-            case .success(let record):
-                self.completeHDR(id, token: token, record: record)
-            case .failure(let failure):
-                self.failHDR(id, token: token, code: failure.code, kind: failure.kind)
-            }
+            restorePendingHDRJobs()
+        default:
+            break
         }
     }
 
-    /// VE-HDR 2.0 job. With `alsoRunV1` (developer "both") V1 runs first and keeps its own files;
-    /// V2 then writes its own master beside it. Neither ever overwrites the other.
-    private func startRealHDRV2(for id: UUID, manifest: CaptureManifest, alsoRunV1: Bool) {
-        guard let index = captures.firstIndex(where: { $0.id == id }) else { return }
-        preparationTasks[id]?.cancel()
-        let token = UUID()
-        hdrJobTokens[id] = token
-        captures[index].hdrState = .pending
-        captures[index].jobState = .queued
+    /// Starts the single worker when there is waiting work. Concurrency is exactly 1.
+    private func pumpHDRQueue() {
+        guard hdrWorker == nil, hdrQueue.contains(where: { $0.state == .queued }) else { return }
+        let workerID = UUID()
+        hdrWorkerID = workerID
+        hdrWorker = Task { [weak self] in
+            while !Task.isCancelled, let self, let next = self.hdrQueue.first(where: { $0.state == .queued }) {
+                await self.runHDRJob(next.id)
+            }
+            guard let self, self.hdrWorkerID == workerID else { return }
+            self.hdrWorker = nil
+            self.hdrWorkerID = nil
+            // A job queued during the last await is picked up at once.
+            self.pumpHDRQueue()
+        }
+    }
+
+    private func hdrQueueIndex(_ jobID: UUID) -> Int? {
+        hdrQueue.firstIndex { $0.id == jobID }
+    }
+
+    private func timeoutSeconds(for pipeline: HDRPipelineSelection) -> Double {
+        switch pipeline {
+        case .v1: hdrTimeoutSeconds
+        case .v2: hdrV2TimeoutSeconds
+        case .both: hdrV2TimeoutSeconds + hdrTimeoutSeconds
+        }
+    }
+
+    /// Runs one job to READY or an explicit failure, then returns so the next job can start.
+    /// The watchdog — not the pipeline — decides when the worker is released.
+    private func runHDRJob(_ jobID: UUID) async {
+        guard let job = hdrQueue.first(where: { $0.id == jobID }), job.state == .queued else { return }
+        let id = job.captureID
+
+        // The camera has priority, but only for a bounded time: a shutter state that never
+        // ends can no longer hold processing back forever.
+        let deferStarted = Date()
+        while isCapturing, Date().timeIntervalSince(deferStarted) < hdrCaptureDeferSeconds, !Task.isCancelled {
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+        guard let index = hdrQueueIndex(jobID), hdrQueue[index].state == .queued else { return }
+        guard let capture = captures.first(where: { $0.id == id }),
+              let manifest = capture.manifest,
+              let token = hdrJobTokens[id]
+        else {
+            closeQueueJob(jobID, state: .cancelled, code: "HDR_CAPTURE_MISSING", detail: nil)
+            return
+        }
+
+        let pipeline = job.requestedPipeline
         let now = Date()
-        hdrJobs[id] = HDRJobDiagnostics(jobStartedAt: now, stage: .queued, lastProgressAt: now)
-        let timeout = hdrV2TimeoutSeconds + (alsoRunV1 ? hdrTimeoutSeconds : 0)
-        let profile = hdrProfileV2
+        hdrQueue[index].state = .running
+        hdrQueue[index].actualPipeline = pipeline
+        hdrQueue[index].startedAt = now
+        hdrQueue[index].lastProgressAt = now
+        hdrQueue[index].stage = .validating
+        hdrJobs[id] = HDRJobDiagnostics(jobStartedAt: now, stage: .validating, lastProgressAt: now)
+        setJobState(id, .processing)
+        setHDRState(id, .processing)
+        VELog.camera("hdr job started capture=\(id.uuidString.prefix(8)) pipeline=\(pipeline.rawValue)")
+
+        let cancellation = HDRCancellationFlag()
+        let timeout = timeoutSeconds(for: pipeline)
+        launchPipeline(id: id, token: token, manifest: manifest, pipeline: pipeline, cancellation: cancellation)
+
+        let poll = max(0.0005, min(hdrWatchdogInterval, timeout / 2))
+        while !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(poll))
+            guard let index = hdrQueueIndex(jobID), hdrQueue[index].state.isRunning else { break }
+            let current = hdrQueue[index]
+            if hdrSuspendedAt != nil { continue }
+            if current.elapsedSeconds() > timeout {
+                cancellation.cancel()
+                let code = pipeline == .v1 ? "HDR_TIMEOUT" : HDRPipelineV2.Code.timeout
+                let detail = "no result after \(Int(timeout)) s at \(current.stage.queueLabel)"
+                failHDR(id, token: token, code: code, kind: .technical, detail: detail)
+                // Even if the capture moved on meanwhile, the worker is released now.
+                closeQueueJob(jobID, state: .failed, code: code, detail: detail)
+                preparationTasks[id] = nil
+                break
+            }
+            if current.state == .running, current.secondsSinceProgress() > hdrStallSeconds {
+                hdrQueue[index].state = .stalled
+                VELog.cameraError("HDR_STALLED", "capture=\(id.uuidString.prefix(8)) stage=\(current.stage.queueLabel)")
+            }
+        }
+        if Task.isCancelled {
+            cancellation.cancel()
+            closeQueueJob(jobID, state: .cancelled, code: nil, detail: nil)
+        }
+    }
+
+    /// The work itself, off the main actor. Its result only counts while the job's token is
+    /// current, so a result arriving after the watchdog fired is ignored.
+    private func launchPipeline(
+        id: UUID,
+        token: UUID,
+        manifest: CaptureManifest,
+        pipeline: HDRPipelineSelection,
+        cancellation: HDRCancellationFlag
+    ) {
+        var profile = hdrProfileV2
+        profile.timeoutSeconds = min(profile.timeoutSeconds, hdrV2TimeoutSeconds)
+        let progress: @Sendable (HDRStage) -> Void = { [weak self] stage in
+            Task { @MainActor in
+                self?.updateHDRStage(id, token: token, stage: stage)
+            }
+        }
 
         preparationTasks[id] = Task { [weak self] in
-            guard let self else { return }
-            while self.isCapturing && !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(300))
-            }
-            guard !Task.isCancelled, self.hdrJobTokens[id] == token else { return }
-            self.setJobState(id, .processing)
-            self.setHDRState(id, .processing)
-
-            let watchdog = Task { [weak self] in
-                try? await Task.sleep(for: .seconds(timeout))
-                guard !Task.isCancelled else { return }
-                self?.failHDR(id, token: token, code: HDRPipelineV2.Code.timeout, kind: .technical)
-            }
-            let progress: @Sendable (HDRStage) -> Void = { stage in
-                Task { @MainActor [weak self] in
-                    self?.updateHDRStage(id, token: token, stage: stage)
-                }
+            // 0 · physical input check: 9 files on disk, readable, matching their hash, EV 0 present.
+            let check = await Task.detached(priority: .utility) { HDRInputCheck.verify(manifest) }.value
+            guard let self, self.hdrJobTokens[id] == token else { return }
+            self.hdrInputChecks[id] = check
+            if let code = check.errorCode {
+                self.failHDR(id, token: token, code: code, kind: .sourceRejected, detail: check.detail)
+                return
             }
 
-            if alsoRunV1 {
+            if pipeline.runsV1 {
                 let v1 = await Task.detached(priority: .utility) {
                     HDRProcessingService.process(manifest: manifest, captureID: id, progress: progress)
                 }.value
-                if case .success(let record) = v1, self.hdrJobTokens[id] == token,
-                   let index = self.captures.firstIndex(where: { $0.id == id }) {
+                guard self.hdrJobTokens[id] == token else { return }
+                if !pipeline.runsV2 {
+                    switch v1 {
+                    case .success(let record): self.completeHDR(id, token: token, record: record)
+                    case .failure(let failure): self.failHDR(id, token: token, code: failure.code, kind: failure.kind, detail: failure.detail)
+                    }
+                    return
+                }
+                if case .success(let record) = v1, let index = self.captures.firstIndex(where: { $0.id == id }) {
                     self.attachMaster(record, to: &self.captures[index])
                     self.captures[index].hdrState = .processing
                 }
             }
-            guard !Task.isCancelled, self.hdrJobTokens[id] == token else { watchdog.cancel(); return }
+            guard !cancellation.isCancelled, self.hdrJobTokens[id] == token else { return }
 
             let result = await Task.detached(priority: .utility) {
-                HDRPipelineV2.process(manifest: manifest, captureID: id, profile: profile, progress: progress)
+                HDRPipelineV2.process(
+                    manifest: manifest,
+                    captureID: id,
+                    profile: profile,
+                    cancellation: cancellation,
+                    progress: progress
+                )
             }.value
-            watchdog.cancel()
 
             switch result {
             case .success(let record):
                 self.completeHDRV2(id, token: token, record: record)
             case .failure(let failure):
                 // A V1 master produced in the same job still makes the capture ready.
-                if alsoRunV1, self.captures.first(where: { $0.id == id })?.hdrMaster != nil {
+                if pipeline.runsV1, self.captures.first(where: { $0.id == id })?.hdrMaster != nil {
                     self.completeAfterV2Failure(id, token: token, code: failure.code)
                 } else {
-                    self.failHDR(id, token: token, code: failure.code, kind: failure.kind)
+                    self.failHDR(id, token: token, code: failure.code, kind: failure.kind, detail: failure.detail)
                 }
             }
         }
+    }
+
+    /// Ends a queue job. Called for every READY, FAILED and CANCELLED outcome.
+    private func closeQueueJob(_ jobID: UUID, state: HDRQueueJobState, code: String?, detail: String?) {
+        guard let index = hdrQueueIndex(jobID), hdrQueue[index].state.isActive else { return }
+        let now = Date()
+        hdrQueue[index].state = state
+        hdrQueue[index].finishedAt = now
+        hdrQueue[index].lastProgressAt = now
+        hdrQueue[index].stage = state == .ready ? .done : .failed
+        hdrQueue[index].errorCode = code
+        hdrQueue[index].errorDetail = detail
+        VELog.camera(
+            "hdr job \(state.rawValue) capture=\(hdrQueue[index].captureID.uuidString.prefix(8)) "
+                + "t=\(String(format: "%.1f", hdrQueue[index].elapsedSeconds()))s\(code.map { " code=\($0)" } ?? "")"
+        )
     }
 
     private func completeHDRV2(_ id: UUID, token: UUID, record: HDRMasterV2Record) {
@@ -726,7 +923,7 @@ final class AppState {
     func reprocessHDR(captureID: UUID, pipeline: HDRPipelineSelection) {
         guard let capture = captures.first(where: { $0.id == captureID }),
               let manifest = capture.manifest, manifest.state.isValid else { return }
-        startRealHDR(for: captureID, manifest: manifest, pipeline: pipeline)
+        enqueueHDR(captureID: captureID, pipeline: pipeline)
     }
 
     /// Developer only: which verified master the capture displays.
@@ -745,6 +942,11 @@ final class AppState {
         job.stage = stage
         job.lastProgressAt = .now
         hdrJobs[id] = job
+        if let index = hdrQueue.lastIndex(where: { $0.captureID == id && $0.state.isRunning }) {
+            hdrQueue[index].stage = stage
+            hdrQueue[index].lastProgressAt = .now
+            if hdrQueue[index].state == .stalled { hdrQueue[index].state = .running }
+        }
     }
 
     /// READY only with a verified master on disk. The primary image switches to it at once.
@@ -761,7 +963,7 @@ final class AppState {
         finishJob(id)
     }
 
-    private func failHDR(_ id: UUID, token: UUID, code: String, kind: HDRProcessingFailure.Kind) {
+    private func failHDR(_ id: UUID, token: UUID, code: String, kind: HDRProcessingFailure.Kind, detail: String? = nil) {
         guard hdrJobTokens[id] == token, let index = captures.firstIndex(where: { $0.id == id }) else { return }
         // Invalidate the token: a late result of this job can no longer change anything.
         hdrJobTokens[id] = UUID()
@@ -769,7 +971,7 @@ final class AppState {
             // A re-run failed, but a verified master from an earlier run is still on disk.
             captures[index].hdrState = .generated
             captures[index].jobState = .ready
-            closeHDRJob(id, stage: .failed, errorCode: code)
+            closeHDRJob(id, stage: .failed, errorCode: code, detail: detail)
             VELog.cameraError(code, "hdr capture=\(id.uuidString.prefix(8)) (earlier master kept)")
             finishJob(id)
             return
@@ -782,12 +984,16 @@ final class AppState {
             captures[index].hdrState = .sourceRejected
             captures[index].jobState = .needsReview
         }
-        closeHDRJob(id, stage: .failed, errorCode: code)
-        VELog.cameraError(code, "hdr capture=\(id.uuidString.prefix(8))")
+        closeHDRJob(id, stage: .failed, errorCode: code, detail: detail)
+        VELog.cameraError(code, "hdr capture=\(id.uuidString.prefix(8))\(detail.map { " \($0)" } ?? "")")
         finishJob(id)
     }
 
-    private func closeHDRJob(_ id: UUID, stage: HDRStage, errorCode: String?) {
+    private func closeHDRJob(_ id: UUID, stage: HDRStage, errorCode: String?, detail: String? = nil) {
+        // The queue job ends with the capture's job: READY or FAILED, never left running.
+        if let queued = activeHDRJob(for: id) {
+            closeQueueJob(queued.id, state: stage == .done ? .ready : .failed, code: errorCode, detail: detail)
+        }
         guard var job = hdrJobs[id] else { return }
         job.stage = stage
         job.finishedAt = .now
@@ -960,8 +1166,16 @@ final class AppState {
     func devReset() {
         for task in preparationTasks.values { task.cancel() }
         preparationTasks = [:]
+        for index in hdrQueue.indices where hdrQueue[index].state.isActive {
+            closeQueueJob(hdrQueue[index].id, state: .cancelled, code: nil, detail: nil)
+        }
+        hdrWorker?.cancel()
+        hdrWorker = nil
+        hdrWorkerID = nil
         hdrJobs = [:]
         hdrJobTokens = [:]
+        hdrInputChecks = [:]
+        hdrMissingJobs = [:]
         properties = MockData.properties()
         captures = MockData.captures()
         transactions = MockData.creditHistory()
